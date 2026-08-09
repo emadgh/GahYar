@@ -3,6 +3,7 @@
 mod calendar;
 mod events;
 mod settings;
+mod update;
 
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -18,7 +19,7 @@ use settings::{set_autostart, Settings, Theme};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::DataExchange::*;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource};
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::CreateMutexW;
@@ -34,6 +35,7 @@ const BASE_WIDTH: i32 = 430;
 const BASE_HEIGHT_CALENDAR: i32 = 517;
 const BASE_EVENTS_HEIGHT: i32 = 136;
 const BASE_FOOTER_HEIGHT: i32 = 30;
+const BASE_UPDATE_HEIGHT: i32 = 42;
 const BASE_SETTINGS_HEIGHT: i32 = 614;
 const BASE_ABOUT_WIDTH: i32 = 380;
 const BASE_ABOUT_HEIGHT: i32 = 250;
@@ -48,6 +50,8 @@ const EVENTS_TOP: i32 = 503;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_EXISTING: u32 = WM_APP + 2;
+const WM_UPDATE_STATUS: u32 = WM_APP + 3;
+const WM_APPLY_UPDATE: u32 = WM_APP + 4;
 const TRAY_ID: u32 = 1;
 const CMD_OPEN: usize = 1001;
 const CMD_SETTINGS: usize = 1002;
@@ -56,10 +60,13 @@ const CMD_EXIT: usize = 1005;
 const DATE_REFRESH_TIMER_ID: usize = 1;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const INSTANCE_MUTEX_NAME: &str = "Local\\GahYar.SingleInstance";
+const FONT_RESOURCE_ID: usize = 101;
+const RCDATA_RESOURCE_TYPE: usize = 10;
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 static EXITING: AtomicBool = AtomicBool::new(false);
 static ABOUT_HWND: AtomicIsize = AtomicIsize::new(0);
+static FONT_RESOURCE_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
@@ -98,13 +105,14 @@ impl AppState {
     }
 
     fn base_height(&self) -> i32 {
-        if self.view == ViewMode::Settings {
+        let update_height = if update::banner_visible() { BASE_UPDATE_HEIGHT } else { 0 };
+        (if self.view == ViewMode::Settings {
             BASE_SETTINGS_HEIGHT + BASE_FOOTER_HEIGHT
         } else {
             BASE_HEIGHT_CALENDAR
                 + if self.settings.show_events { BASE_EVENTS_HEIGHT } else { 0 }
                 + BASE_FOOTER_HEIGHT
-        }
+        }) + update_height
     }
 
     fn scale(&self) -> u32 { self.settings.ui_scale }
@@ -396,8 +404,8 @@ fn event_items_for_view<'a>(app: &'a AppState) -> Vec<(u32, &'a CalendarEvent)> 
 unsafe fn paint_main(hwnd: HWND) {
     unsafe {
         let mut ps: PAINTSTRUCT = zeroed();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        if hdc.is_null() { return; }
+        let window_hdc = BeginPaint(hwnd, &mut ps);
+        if window_hdc.is_null() { return; }
 
         let app = state().lock().unwrap();
         let scale = app.scale();
@@ -405,6 +413,17 @@ unsafe fn paint_main(hwnd: HWND) {
         let fonts = Fonts::create(scale);
         let width = scaled(BASE_WIDTH, scale);
         let height = scaled(app.base_height(), scale);
+        let hdc = CreateCompatibleDC(window_hdc);
+        let bitmap = CreateCompatibleBitmap(window_hdc, width, height);
+        if hdc.is_null() || bitmap.is_null() {
+            if !hdc.is_null() { DeleteDC(hdc); }
+            if !bitmap.is_null() { DeleteObject(bitmap as HGDIOBJ); }
+            drop(app);
+            fonts.destroy();
+            EndPaint(hwnd, &ps);
+            return;
+        }
+        let old_bitmap = SelectObject(hdc, bitmap as HGDIOBJ);
         fill_rect_color(hdc, RECT { left: 0, top: 0, right: width, bottom: height }, palette.background);
         draw_round_fill(hdc, RECT { left: 0, top: 0, right: width, bottom: height }, palette.surface, scaled(18, scale));
 
@@ -420,6 +439,10 @@ unsafe fn paint_main(hwnd: HWND) {
             scaled(18, scale),
             1,
         );
+        BitBlt(window_hdc, 0, 0, width, height, hdc, 0, 0, SRCCOPY);
+        SelectObject(hdc, old_bitmap);
+        DeleteObject(bitmap as HGDIOBJ);
+        DeleteDC(hdc);
         drop(app);
         fonts.destroy();
         EndPaint(hwnd, &ps);
@@ -651,12 +674,44 @@ unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Font
     unsafe {
         let scale = app.scale();
         let top = app.base_height() - BASE_FOOTER_HEIGHT;
+        paint_update_banner(hdc, app, palette, fonts, top);
         draw_text(
             hdc,
             "نوشته شده توسط عماد قاسمی — emadghasemi.ir",
             scaled_rect(RECT { left: 16, top, right: BASE_WIDTH - 16, bottom: top + BASE_FOOTER_HEIGHT - 3 }, scale),
             palette.accent,
             fonts.tiny,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+        );
+    }
+}
+
+unsafe fn paint_update_banner(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts, footer_top: i32) {
+    let status = update::status();
+    let (text, color) = match status {
+        update::UpdateStatus::Available(info) => (
+            format!("نسخه جدید {} منتشر شده — برای بروزرسانی کلیک کنید", persian_digits(info.version)),
+            palette.accent,
+        ),
+        update::UpdateStatus::Downloading => ("در حال دریافت و نصب نسخه جدید…".to_string(), palette.event),
+        update::UpdateStatus::Failed(_) => ("بروزرسانی خودکار ناموفق بود — دانلود دستی".to_string(), palette.holiday),
+        _ => return,
+    };
+    unsafe {
+        let scale = app.scale();
+        let top = footer_top - BASE_UPDATE_HEIGHT;
+        draw_round_fill(
+            hdc,
+            scaled_rect(RECT { left: 18, top: top + 4, right: BASE_WIDTH - 18, bottom: footer_top - 3 }, scale),
+            palette.surface_alt,
+            scaled(11, scale),
+        );
+        draw_text(
+            hdc,
+            &text,
+            scaled_rect(RECT { left: 28, top: top + 4, right: BASE_WIDTH - 28, bottom: footer_top - 3 }, scale),
+            color,
+            fonts.small,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
     }
@@ -733,13 +788,22 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
     let mut show_about_dialog = false;
     let mut open_website_link = false;
     let mut refresh_tooltip = false;
+    let mut start_update = false;
+    let mut update_release_url = None;
     let mut resize = false;
     {
         let mut app = state().lock().unwrap();
         let x = unscaled(x, app.scale());
         let y = unscaled(y, app.scale());
-        if y >= app.base_height() - BASE_FOOTER_HEIGHT {
+        let footer_top = app.base_height() - BASE_FOOTER_HEIGHT;
+        if y >= footer_top {
             open_website_link = true;
+        } else if update::banner_visible() && y >= footer_top - BASE_UPDATE_HEIGHT {
+            match update::status() {
+                update::UpdateStatus::Available(_) => start_update = true,
+                update::UpdateStatus::Failed(info) => update_release_url = Some(info.release_url),
+                _ => {}
+            }
         } else { match app.view {
             ViewMode::Calendar => {
                 if y >= 8 && y <= 48 && x <= 75 {
@@ -860,6 +924,36 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
     if show_about_dialog { unsafe { show_about(hwnd); } }
     if open_website_link { unsafe { open_website(hwnd); } }
     if refresh_tooltip { unsafe { refresh_tray_tooltip(hwnd); } }
+    if start_update { update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE); }
+    if let Some(url) = update_release_url { unsafe { open_url(hwnd, &url); } }
+}
+
+unsafe fn install_embedded_font(instance: HINSTANCE) {
+    unsafe {
+        let resource = FindResourceW(
+            instance,
+            FONT_RESOURCE_ID as *const u16,
+            RCDATA_RESOURCE_TYPE as *const u16,
+        );
+        if resource.is_null() { return; }
+        let size = SizeofResource(instance, resource);
+        let loaded = LoadResource(instance, resource);
+        if size == 0 || loaded.is_null() { return; }
+        let data = LockResource(loaded);
+        if data.is_null() { return; }
+        let mut fonts_added = 0u32;
+        let handle = AddFontMemResourceEx(data, size, null(), &mut fonts_added);
+        if !handle.is_null() && fonts_added > 0 {
+            FONT_RESOURCE_HANDLE.store(handle as isize, Ordering::SeqCst);
+        }
+    }
+}
+
+unsafe fn uninstall_embedded_font() {
+    let handle = FONT_RESOURCE_HANDLE.swap(0, Ordering::SeqCst) as HANDLE;
+    if !handle.is_null() {
+        unsafe { RemoveFontMemResourceEx(handle); }
+    }
 }
 
 fn clipboard_date(kind: CalendarKind, date: Date) -> String {
@@ -907,9 +1001,13 @@ unsafe fn load_app_icon(instance: HINSTANCE) -> HICON {
 }
 
 unsafe fn open_website(hwnd: HWND) {
+    unsafe { open_url(hwnd, WEBSITE_URL); }
+}
+
+unsafe fn open_url(hwnd: HWND, address: &str) {
     unsafe {
         let operation = wide("open");
-        let url = wide(WEBSITE_URL);
+        let url = wide(address);
         ShellExecuteW(hwnd, operation.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL);
     }
 }
@@ -1063,9 +1161,20 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
     match msg {
         WM_CREATE => {
             unsafe { add_tray_icon(hwnd); SetTimer(hwnd, DATE_REFRESH_TIMER_ID, 60_000, None); resize_main_window(hwnd, false); }
+            update::start_check(hwnd, WM_UPDATE_STATUS);
             0
         }
         WM_PAINT => { unsafe { paint_main(hwnd); } 0 }
+        WM_ERASEBKGND => 1,
+        WM_UPDATE_STATUS => {
+            unsafe { resize_main_window(hwnd, true); InvalidateRect(hwnd, null(), 0); }
+            0
+        }
+        WM_APPLY_UPDATE => {
+            EXITING.store(true, Ordering::SeqCst);
+            unsafe { DestroyWindow(hwnd); }
+            0
+        }
         WM_LBUTTONUP => {
             let (x, y) = point_from_lparam(lparam);
             unsafe { handle_main_click(hwnd, x, y); }
@@ -1301,7 +1410,9 @@ fn main() {
         }
 
         let instance = GetModuleHandleW(null());
+        install_embedded_font(instance);
         if !register_window_classes(instance) {
+            uninstall_embedded_font();
             CloseHandle(instance_mutex);
             return;
         }
@@ -1326,6 +1437,7 @@ fn main() {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        uninstall_embedded_font();
         CloseHandle(instance_mutex);
     }
 }
