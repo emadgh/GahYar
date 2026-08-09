@@ -44,6 +44,7 @@ const BASE_ABOUT_HEIGHT: i32 = 300;
 
 const GRID_LEFT: i32 = 18;
 const GRID_TOP: i32 = 159;
+const GRID_CONTENT_TOP_PADDING: i32 = 4;
 const CELL_WIDTH: i32 = 56;
 const CELL_HEIGHT: i32 = 54;
 const GRID_WIDTH: i32 = CELL_WIDTH * 7;
@@ -63,7 +64,6 @@ const CMD_UPDATE: usize = 1004;
 const CMD_EXIT: usize = 1005;
 const DATE_REFRESH_TIMER_ID: usize = 1;
 const UPDATE_CHECK_TIMER_ID: usize = 2;
-const TASKBAR_LAYOUT_TIMER_ID: usize = 3;
 const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1000;
 const TASKBAR_WIDGET_TRANSPARENT_COLOR: COLORREF = 0x00ff00ff;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
@@ -547,7 +547,7 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             let has_events = !app.events.events_for_day(jalali.year, jalali.month, jalali.day).is_empty();
 
             let left = GRID_LEFT + visual_column * CELL_WIDTH;
-            let top = GRID_TOP + row * CELL_HEIGHT;
+            let top = GRID_TOP + GRID_CONTENT_TOP_PADDING + row * CELL_HEIGHT;
             let cell_rect = sr(RECT { left: left + 3, top: top + 3, right: left + CELL_WIDTH - 3, bottom: top + CELL_HEIGHT - 3 });
             if is_selected {
                 draw_round_fill(hdc, cell_rect, palette.selected, scaled(9, scale));
@@ -830,7 +830,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         paint_toggle_row(hdc, app, palette, fonts, 482, "نمایش تاریخ کامل در Tooltip", app.settings.show_tray_date);
         paint_toggle_row(hdc, app, palette, fonts, 526, "بروزرسانی خودکار و بی‌صدا", app.settings.auto_update);
         paint_toggle_row(hdc, app, palette, fonts, 570, "نمایش شماره روز روی آیکن Tray", app.settings.tray_day_icon);
-        paint_toggle_row(hdc, app, palette, fonts, 614, "نمایش ویجت تاریخ کنار تسکبار", app.settings.taskbar_widget);
+        paint_toggle_row(hdc, app, palette, fonts, 614, "ویجت تسکبار (منسوخ و غیرفعال)", false);
         paint_toggle_row(hdc, app, palette, fonts, 658, "اجرا همراه با ویندوز", app.settings.autostart);
 
         draw_round_fill(hdc, sr(RECT { left: 24, top: 713, right: 406, bottom: 755 }), palette.accent, scaled(12, scale));
@@ -1009,7 +1009,7 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                     app.settings.save();
                     refresh_tray_visual = true;
                 } else if (613..=656).contains(&y) {
-                    app.settings.taskbar_widget = !app.settings.taskbar_widget;
+                    app.settings.taskbar_widget = false;
                     app.settings.save();
                     refresh_taskbar_widget = true;
                 } else if (657..=704).contains(&y) {
@@ -1381,7 +1381,8 @@ unsafe fn taskbar_widget_position() -> Option<(HWND, i32, i32, i32, i32)> {
 unsafe fn update_taskbar_widget(owner: HWND) {
     unsafe {
         TASKBAR_WIDGET_OWNER.store(owner as isize, Ordering::SeqCst);
-        let enabled = state().lock().unwrap().settings.taskbar_widget;
+        // Obsolete since 2.4.2. Always remove the old widget and restore taskbar space.
+        let enabled = false;
         let mut widget = TASKBAR_WIDGET_HWND.load(Ordering::SeqCst) as HWND;
         if !enabled {
             restore_taskbar_layout();
@@ -1591,7 +1592,6 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
                 update_taskbar_widget(hwnd);
                 SetTimer(hwnd, DATE_REFRESH_TIMER_ID, 60_000, None);
                 SetTimer(hwnd, UPDATE_CHECK_TIMER_ID, UPDATE_CHECK_INTERVAL_MS, None);
-                SetTimer(hwnd, TASKBAR_LAYOUT_TIMER_ID, 1_000, None);
                 resize_main_window(hwnd, false);
             }
             update::start_check(hwnd, WM_UPDATE_STATUS);
@@ -1670,12 +1670,6 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
         }
         WM_TIMER if wparam == UPDATE_CHECK_TIMER_ID => {
             update::start_check(hwnd, WM_UPDATE_STATUS);
-            0
-        }
-        WM_TIMER if wparam == TASKBAR_LAYOUT_TIMER_ID => {
-            if state().lock().unwrap().settings.taskbar_widget {
-                unsafe { update_taskbar_widget(hwnd); }
-            }
             0
         }
         WM_MOUSEWHEEL => {
@@ -1765,7 +1759,6 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
             unsafe {
                 KillTimer(hwnd, DATE_REFRESH_TIMER_ID);
                 KillTimer(hwnd, UPDATE_CHECK_TIMER_ID);
-                KillTimer(hwnd, TASKBAR_LAYOUT_TIMER_ID);
                 restore_taskbar_layout();
                 let widget = TASKBAR_WIDGET_HWND.load(Ordering::SeqCst) as HWND;
                 if !widget.is_null() && IsWindow(widget) != 0 { DestroyWindow(widget); }

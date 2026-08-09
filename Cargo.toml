@@ -1,6 +1,6 @@
 [package]
 name = "gahyar"
-version = "2.4.1"
+version = "2.4.2"
 edition = "2024"
 description = "گاه‌یار، تقویم فارسی سبک برای Windows"
 license = "MIT"

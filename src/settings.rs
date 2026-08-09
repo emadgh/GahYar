@@ -91,7 +91,8 @@ impl Settings {
                     "show_tray_date" => settings.show_tray_date = parse_bool(value),
                     "auto_update" => settings.auto_update = parse_bool(value),
                     "tray_day_icon" => settings.tray_day_icon = parse_bool(value),
-                    "taskbar_widget" => settings.taskbar_widget = parse_bool(value),
+                    // Obsolete since 2.4.2: retain the key only for settings-file compatibility.
+                    "taskbar_widget" => settings.taskbar_widget = false,
                     "autostart" => settings.autostart = parse_bool(value),
                     _ => {}
                 }
@@ -99,6 +100,7 @@ impl Settings {
         }
         // The registry is the source of truth, so stale settings cannot display a wrong state.
         settings.autostart = is_autostart_enabled();
+        settings.taskbar_widget = false;
         settings
     }
 
