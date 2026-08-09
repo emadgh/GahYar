@@ -26,7 +26,7 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const APP_NAME: &str = "گاهیار";
+const APP_NAME: &str = "گاه‌یار";
 const WEBSITE_URL: &str = "https://emadghasemi.ir";
 const APP_ICON_ID: usize = 1;
 const MAIN_CLASS: &str = "GahYarMain";
@@ -36,7 +36,7 @@ const BASE_HEIGHT_CALENDAR: i32 = 517;
 const BASE_EVENTS_HEIGHT: i32 = 136;
 const BASE_FOOTER_HEIGHT: i32 = 30;
 const BASE_UPDATE_HEIGHT: i32 = 42;
-const BASE_SETTINGS_HEIGHT: i32 = 614;
+const BASE_SETTINGS_HEIGHT: i32 = 658;
 const BASE_ABOUT_WIDTH: i32 = 380;
 const BASE_ABOUT_HEIGHT: i32 = 250;
 
@@ -177,6 +177,10 @@ fn scaled_rect(rect: RECT, scale: u32) -> RECT {
         right: scaled(rect.right, scale),
         bottom: scaled(rect.bottom, scale),
     }
+}
+
+fn calendar_column(column: i32, rtl: bool) -> i32 {
+    if rtl { 6 - column } else { column }
 }
 
 #[derive(Clone, Copy)]
@@ -487,7 +491,8 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         // Weekday header.
         draw_round_fill(hdc, sr(RECT { left: GRID_LEFT, top: 116, right: GRID_LEFT + GRID_WIDTH, bottom: 150 }), palette.accent, scaled(10, scale));
         for (index, weekday) in WEEKDAYS_SHORT.iter().enumerate() {
-            let left = GRID_LEFT + index as i32 * CELL_WIDTH;
+            let visual_column = calendar_column(index as i32, app.settings.calendar_rtl);
+            let left = GRID_LEFT + visual_column * CELL_WIDTH;
             draw_text(
                 hdc,
                 weekday,
@@ -509,6 +514,7 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         for cell in 0..42 {
             let row = cell / 7;
             let column = cell % 7;
+            let visual_column = calendar_column(column, app.settings.calendar_rtl);
             let (primary, in_current_month) = adjacent_date(app.settings.main_calendar, app.year, app.month, cell);
             let gregorian = to_gregorian(app.settings.main_calendar, primary);
             let jalali = from_gregorian(CalendarKind::Jalali, gregorian);
@@ -518,7 +524,7 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             let official_holiday = app.events.is_official_holiday(jalali.year, jalali.month, jalali.day);
             let has_events = !app.events.events_for_day(jalali.year, jalali.month, jalali.day).is_empty();
 
-            let left = GRID_LEFT + column * CELL_WIDTH;
+            let left = GRID_LEFT + visual_column * CELL_WIDTH;
             let top = GRID_TOP + row * CELL_HEIGHT;
             let cell_rect = sr(RECT { left: left + 3, top: top + 3, right: left + CELL_WIDTH - 3, bottom: top + CELL_HEIGHT - 3 });
             if is_selected {
@@ -729,16 +735,17 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         paint_value_row(hdc, app, palette, fonts, 78, "پوسته", app.settings.theme.title());
         paint_scale_row(hdc, app, palette, fonts, 122);
         paint_value_row(hdc, app, palette, fonts, 166, "تقویم اصلی", app.settings.main_calendar.title());
-        paint_toggle_row(hdc, app, palette, fonts, 218, "نمایش تاریخ شمسی", app.settings.show_jalali);
-        paint_toggle_row(hdc, app, palette, fonts, 262, "نمایش تاریخ میلادی", app.settings.show_gregorian);
-        paint_toggle_row(hdc, app, palette, fonts, 306, "نمایش تاریخ قمری", app.settings.show_hijri);
-        paint_toggle_row(hdc, app, palette, fonts, 350, "نمایش عنوان تقویم‌های جانبی", app.settings.show_subtitles);
-        paint_toggle_row(hdc, app, palette, fonts, 394, "نمایش بخش مناسبت‌ها", app.settings.show_events);
-        paint_toggle_row(hdc, app, palette, fonts, 438, "نمایش تاریخ کامل در Tooltip", app.settings.show_tray_date);
-        paint_toggle_row(hdc, app, palette, fonts, 482, "اجرا همراه با ویندوز", app.settings.autostart);
+        paint_toggle_row(hdc, app, palette, fonts, 218, "چیدمان تقویم از راست به چپ", app.settings.calendar_rtl);
+        paint_toggle_row(hdc, app, palette, fonts, 262, "نمایش تاریخ شمسی", app.settings.show_jalali);
+        paint_toggle_row(hdc, app, palette, fonts, 306, "نمایش تاریخ میلادی", app.settings.show_gregorian);
+        paint_toggle_row(hdc, app, palette, fonts, 350, "نمایش تاریخ قمری", app.settings.show_hijri);
+        paint_toggle_row(hdc, app, palette, fonts, 394, "نمایش عنوان تقویم‌های جانبی", app.settings.show_subtitles);
+        paint_toggle_row(hdc, app, palette, fonts, 438, "نمایش بخش مناسبت‌ها", app.settings.show_events);
+        paint_toggle_row(hdc, app, palette, fonts, 482, "نمایش تاریخ کامل در Tooltip", app.settings.show_tray_date);
+        paint_toggle_row(hdc, app, palette, fonts, 526, "اجرا همراه با ویندوز", app.settings.autostart);
 
-        draw_round_fill(hdc, sr(RECT { left: 24, top: 537, right: 406, bottom: 579 }), palette.accent, scaled(12, scale));
-        draw_text(hdc, "بازنشانی تنظیمات", sr(RECT { left: 24, top: 537, right: 406, bottom: 579 }), palette.accent_text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        draw_round_fill(hdc, sr(RECT { left: 24, top: 581, right: 406, bottom: 623 }), palette.accent, scaled(12, scale));
+        draw_text(hdc, "بازنشانی تنظیمات", sr(RECT { left: 24, top: 581, right: 406, bottom: 623 }), palette.accent_text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         paint_footer(hdc, app, palette, fonts);
     }
 }
@@ -809,7 +816,7 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                 if y >= 8 && y <= 48 && x <= 75 {
                     let kind = app.settings.main_calendar;
                     let (mut year, mut month) = (app.year, app.month);
-                    add_month(kind, &mut year, &mut month, 1);
+                    add_month(kind, &mut year, &mut month, if app.settings.calendar_rtl { 1 } else { -1 });
                     app.year = year;
                     app.month = month;
                     app.selected_day = None;
@@ -817,7 +824,7 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                 } else if y >= 8 && y <= 48 && x >= 355 {
                     let kind = app.settings.main_calendar;
                     let (mut year, mut month) = (app.year, app.month);
-                    add_month(kind, &mut year, &mut month, -1);
+                    add_month(kind, &mut year, &mut month, if app.settings.calendar_rtl { -1 } else { 1 });
                     app.year = year;
                     app.month = month;
                     app.selected_day = None;
@@ -836,7 +843,8 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                 } else if (GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y)
                     && (GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
                 {
-                    let column = (x - GRID_LEFT) / CELL_WIDTH;
+                    let visual_column = (x - GRID_LEFT) / CELL_WIDTH;
+                    let column = calendar_column(visual_column, app.settings.calendar_rtl);
                     let row = (y - GRID_TOP) / CELL_HEIGHT;
                     let cell = row * 7 + column;
                     let (clicked, in_current) = adjacent_date(app.settings.main_calendar, app.year, app.month, cell);
@@ -877,32 +885,35 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                     app.set_main_calendar(next);
                     app.settings.save();
                 } else if (216..=258).contains(&y) {
-                    app.settings.show_jalali = !app.settings.show_jalali;
+                    app.settings.calendar_rtl = !app.settings.calendar_rtl;
                     app.settings.save();
                 } else if (260..=302).contains(&y) {
-                    app.settings.show_gregorian = !app.settings.show_gregorian;
+                    app.settings.show_jalali = !app.settings.show_jalali;
                     app.settings.save();
                 } else if (304..=346).contains(&y) {
-                    app.settings.show_hijri = !app.settings.show_hijri;
+                    app.settings.show_gregorian = !app.settings.show_gregorian;
                     app.settings.save();
                 } else if (348..=390).contains(&y) {
-                    app.settings.show_subtitles = !app.settings.show_subtitles;
+                    app.settings.show_hijri = !app.settings.show_hijri;
                     app.settings.save();
                 } else if (392..=434).contains(&y) {
+                    app.settings.show_subtitles = !app.settings.show_subtitles;
+                    app.settings.save();
+                } else if (436..=478).contains(&y) {
                     app.settings.show_events = !app.settings.show_events;
                     app.settings.save();
                     resize = true;
-                } else if (436..=480).contains(&y) {
+                } else if (480..=522).contains(&y) {
                     app.settings.show_tray_date = !app.settings.show_tray_date;
                     app.settings.save();
                     refresh_tooltip = true;
-                } else if (480..=526).contains(&y) {
+                } else if (524..=570).contains(&y) {
                     let next = !app.settings.autostart;
                     if set_autostart(next) {
                         app.settings.autostart = next;
                         app.settings.save();
                     }
-                } else if (530..=590).contains(&y) {
+                } else if (574..=634).contains(&y) {
                     let default_settings = Settings::default();
                     let next_main = default_settings.main_calendar;
                     if next_main != app.settings.main_calendar {
@@ -988,7 +999,8 @@ unsafe fn copy_date_at_point(hwnd: HWND, x: i32, y: i32) {
         let y = unscaled(y, app.scale());
         if !(GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
             || !(GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y) { return; }
-        let column = (x - GRID_LEFT) / CELL_WIDTH;
+        let visual_column = (x - GRID_LEFT) / CELL_WIDTH;
+        let column = calendar_column(visual_column, app.settings.calendar_rtl);
         let row = (y - GRID_TOP) / CELL_HEIGHT;
         let (date, _) = adjacent_date(app.settings.main_calendar, app.year, app.month, row * 7 + column);
         clipboard_date(app.settings.main_calendar, date)
@@ -1036,7 +1048,7 @@ fn tray_tooltip(app: &AppState) -> String {
     let weekday = (first_weekday_saturday(CalendarKind::Jalali, jalali.year, jalali.month)
         + jalali.day as i32 - 1).rem_euclid(7) as usize;
     format!(
-        "گاهیار — {}، {} {} {} | {:04}/{:02}/{:02}",
+        "گاه‌یار — {}، {} {} {} | {:04}/{:02}/{:02}",
         WEEKDAYS[weekday],
         persian_digits(jalali.day),
         month_name(CalendarKind::Jalali, jalali.month),
@@ -1126,9 +1138,9 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() { return; }
-        let open = wide("باز کردن گاهیار");
+        let open = wide("باز کردن گاه‌یار");
         let settings_text = wide("تنظیمات");
-        let about = wide("درباره گاهیار");
+        let about = wide("درباره گاه‌یار");
         let exit = wide("خروج");
         AppendMenuW(menu, MF_STRING, CMD_OPEN, open.as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_SETTINGS, settings_text.as_ptr());
@@ -1221,9 +1233,13 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
                     unsafe { InvalidateRect(hwnd, null(), 0); }
                 }
                 0x25 | 0x27 => {
-                    let delta = if wparam as u32 == 0x25 { 1 } else { -1 };
+                    let left = wparam as u32 == 0x25;
                     let mut app = state().lock().unwrap();
                     if app.view == ViewMode::Calendar {
+                        let delta = match (left, app.settings.calendar_rtl) {
+                            (true, true) | (false, false) => 1,
+                            _ => -1,
+                        };
                         let kind = app.settings.main_calendar;
                         let (mut year, mut month) = (app.year, app.month);
                         add_month(kind, &mut year, &mut month, delta);
@@ -1279,7 +1295,7 @@ unsafe fn show_about(owner: HWND) {
         }
         let instance = GetModuleHandleW(null());
         let class_name = wide(ABOUT_CLASS);
-        let title = wide("درباره گاهیار");
+        let title = wide("درباره گاه‌یار");
         let scale = state().lock().unwrap().scale();
         let width = scaled(BASE_ABOUT_WIDTH, scale);
         let height = scaled(BASE_ABOUT_HEIGHT, scale);
@@ -1317,9 +1333,10 @@ unsafe fn paint_about(hwnd: HWND) {
         let height = scaled(BASE_ABOUT_HEIGHT, scale);
         fill_rect_color(hdc, RECT { left: 0, top: 0, right: width, bottom: height }, palette.surface);
         draw_round_fill(hdc, RECT { left: 0, top: 0, right: width, bottom: height }, palette.surface, scaled(18, scale));
-        draw_text(hdc, "گاه یار،", scaled_rect(RECT { left: 50, top: 16, right: 330, bottom: 56 }, scale), palette.accent, fonts.title, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
-        draw_text(hdc, "نوشته شده توسط عماد قاسمی", scaled_rect(RECT { left: 34, top: 68, right: 346, bottom: 108 }, scale), palette.text, fonts.regular, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
-        draw_text(hdc, "emadghasemi.ir", scaled_rect(RECT { left: 34, top: 112, right: 346, bottom: 160 }, scale), palette.accent, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        draw_text(hdc, "گاه‌یار،", scaled_rect(RECT { left: 50, top: 14, right: 330, bottom: 52 }, scale), palette.accent, fonts.title, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        draw_text(hdc, "نوشته شده توسط عماد قاسمی", scaled_rect(RECT { left: 34, top: 58, right: 346, bottom: 94 }, scale), palette.text, fonts.regular, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        draw_text(hdc, "emadghasemi.ir", scaled_rect(RECT { left: 34, top: 96, right: 346, bottom: 132 }, scale), palette.accent, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        draw_text(hdc, &format!("نسخه {}", persian_digits(env!("CARGO_PKG_VERSION"))), scaled_rect(RECT { left: 34, top: 136, right: 346, bottom: 172 }, scale), palette.muted, fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         draw_round_fill(hdc, scaled_rect(RECT { left: 110, top: 190, right: 270, bottom: 228 }, scale), palette.accent, scaled(12, scale));
         draw_text(hdc, "بستن", scaled_rect(RECT { left: 110, top: 190, right: 270, bottom: 228 }, scale), palette.accent_text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         draw_round_outline(hdc, RECT { left: 0, top: 0, right: width - 1, bottom: height - 1 }, palette.border, scaled(18, scale), 1);
@@ -1439,5 +1456,21 @@ fn main() {
         }
         uninstall_embedded_font();
         CloseHandle(instance_mutex);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::calendar_column;
+
+    #[test]
+    fn calendar_columns_follow_selected_direction() {
+        assert_eq!(calendar_column(0, true), 6);
+        assert_eq!(calendar_column(6, true), 0);
+        assert_eq!(calendar_column(0, false), 0);
+        assert_eq!(calendar_column(6, false), 6);
+        for column in 0..7 {
+            assert_eq!(calendar_column(calendar_column(column, true), true), column);
+        }
     }
 }

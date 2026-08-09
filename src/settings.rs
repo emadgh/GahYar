@@ -38,6 +38,7 @@ pub struct Settings {
     pub theme: Theme,
     pub ui_scale: u32,
     pub main_calendar: CalendarKind,
+    pub calendar_rtl: bool,
     pub show_jalali: bool,
     pub show_gregorian: bool,
     pub show_hijri: bool,
@@ -53,6 +54,7 @@ impl Default for Settings {
             theme: Theme::Dark,
             ui_scale: 90,
             main_calendar: CalendarKind::Jalali,
+            calendar_rtl: true,
             show_jalali: true,
             show_gregorian: true,
             show_hijri: true,
@@ -74,6 +76,7 @@ impl Settings {
                     "theme" => settings.theme = Theme::from_key(value.trim()),
                     "ui_scale" => settings.ui_scale = value.trim().parse::<u32>().unwrap_or(90).clamp(80, 125),
                     "main_calendar" => settings.main_calendar = CalendarKind::from_key(value.trim()),
+                    "calendar_rtl" => settings.calendar_rtl = parse_bool(value),
                     "show_jalali" => settings.show_jalali = parse_bool(value),
                     "show_gregorian" => settings.show_gregorian = parse_bool(value),
                     "show_hijri" => settings.show_hijri = parse_bool(value),
@@ -94,10 +97,11 @@ impl Settings {
         let path = settings_path();
         if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
         let text = format!(
-            "theme={}\nui_scale={}\nmain_calendar={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nautostart={}\n",
+            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nautostart={}\n",
             self.theme.key(),
             self.ui_scale,
             self.main_calendar.key(),
+            self.calendar_rtl,
             self.show_jalali,
             self.show_gregorian,
             self.show_hijri,

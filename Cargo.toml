@@ -1,8 +1,8 @@
 [package]
 name = "gahyar"
-version = "2.2.0"
+version = "2.2.2"
 edition = "2024"
-description = "GahYar, a lightweight RTL Persian calendar for Windows"
+description = "گاه‌یار، تقویم فارسی سبک برای Windows"
 license = "MIT"
 build = "build.rs"
 
