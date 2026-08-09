@@ -24,6 +24,7 @@ use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::*;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const APP_NAME: &str = "گاه‌یار";
@@ -31,12 +32,13 @@ const WEBSITE_URL: &str = "https://emadghasemi.ir";
 const APP_ICON_ID: usize = 1;
 const MAIN_CLASS: &str = "GahYarMain";
 const ABOUT_CLASS: &str = "GahYarAbout";
+const TASKBAR_WIDGET_CLASS: &str = "GahYarTaskbarWidget";
 const BASE_WIDTH: i32 = 430;
 const BASE_HEIGHT_CALENDAR: i32 = 517;
 const BASE_EVENTS_HEIGHT: i32 = 136;
 const BASE_FOOTER_HEIGHT: i32 = 30;
 const BASE_UPDATE_HEIGHT: i32 = 42;
-const BASE_SETTINGS_HEIGHT: i32 = 658;
+const BASE_SETTINGS_HEIGHT: i32 = 790;
 const BASE_ABOUT_WIDTH: i32 = 380;
 const BASE_ABOUT_HEIGHT: i32 = 250;
 
@@ -52,6 +54,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_EXISTING: u32 = WM_APP + 2;
 const WM_UPDATE_STATUS: u32 = WM_APP + 3;
 const WM_APPLY_UPDATE: u32 = WM_APP + 4;
+const WM_MOUSE_LEAVE: u32 = 0x02A3;
 const TRAY_ID: u32 = 1;
 const CMD_OPEN: usize = 1001;
 const CMD_SETTINGS: usize = 1002;
@@ -66,6 +69,9 @@ const RCDATA_RESOURCE_TYPE: usize = 10;
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 static EXITING: AtomicBool = AtomicBool::new(false);
 static ABOUT_HWND: AtomicIsize = AtomicIsize::new(0);
+static TASKBAR_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
+static TASKBAR_WIDGET_OWNER: AtomicIsize = AtomicIsize::new(0);
+static CUSTOM_TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
 static FONT_RESOURCE_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +89,7 @@ struct AppState {
     selected_day: Option<u32>,
     view: ViewMode,
     event_scroll: usize,
+    hovered_cell: Option<i32>,
 }
 
 impl AppState {
@@ -101,11 +108,12 @@ impl AppState {
             selected_day: Some(today_main.day),
             view: ViewMode::Calendar,
             event_scroll: 0,
+            hovered_cell: None,
         }
     }
 
     fn base_height(&self) -> i32 {
-        let update_height = if update::banner_visible() { BASE_UPDATE_HEIGHT } else { 0 };
+        let update_height = if !self.settings.auto_update && update::banner_visible() { BASE_UPDATE_HEIGHT } else { 0 };
         (if self.view == ViewMode::Settings {
             BASE_SETTINGS_HEIGHT + BASE_FOOTER_HEIGHT
         } else {
@@ -590,11 +598,74 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             }
         }
 
+        paint_day_tooltip(hdc, app, palette, fonts);
+
         if app.settings.show_events {
             paint_events(hdc, app, palette, fonts);
         }
         paint_footer(hdc, app, palette, fonts);
     }
+}
+
+unsafe fn paint_day_tooltip(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts) {
+    let Some(cell) = app.hovered_cell else { return; };
+    let (primary, _) = adjacent_date(app.settings.main_calendar, app.year, app.month, cell);
+    let jalali = convert(primary, app.settings.main_calendar, CalendarKind::Jalali);
+    let events = app.events.events_for_day(jalali.year, jalali.month, jalali.day);
+    if events.is_empty() { return; }
+    let text = events.iter().take(3).map(|event| format!("• {}", event.title)).collect::<Vec<_>>().join("\n");
+    let row = cell / 7;
+    let logical_column = cell % 7;
+    let visual_column = calendar_column(logical_column, app.settings.calendar_rtl);
+    let width = 286;
+    let height = 34 + events.len().min(3) as i32 * 22;
+    let center = GRID_LEFT + visual_column * CELL_WIDTH + CELL_WIDTH / 2;
+    let left = (center - width / 2).clamp(12, BASE_WIDTH - width - 12);
+    let top = if row <= 2 {
+        GRID_TOP + (row + 1) * CELL_HEIGHT + 4
+    } else {
+        GRID_TOP + row * CELL_HEIGHT - height - 4
+    };
+    unsafe {
+        let scale = app.scale();
+        let rect = scaled_rect(RECT { left, top, right: left + width, bottom: top + height }, scale);
+        draw_round_fill(hdc, rect, palette.surface_alt, scaled(10, scale));
+        draw_round_outline(hdc, rect, palette.accent, scaled(10, scale), 1);
+        draw_text(
+            hdc,
+            &text,
+            scaled_rect(RECT { left: left + 12, top: top + 7, right: left + width - 12, bottom: top + height - 7 }, scale),
+            palette.text,
+            fonts.small,
+            DT_RIGHT | DT_VCENTER | DT_WORDBREAK | DT_RTLREADING,
+        );
+    }
+}
+
+unsafe fn update_day_hover(hwnd: HWND, x: i32, y: i32) {
+    let changed = {
+        let mut app = state().lock().unwrap();
+        let x = unscaled(x, app.scale());
+        let y = unscaled(y, app.scale());
+        let next = if app.view == ViewMode::Calendar
+            && (GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
+            && (GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y)
+        {
+            let visual_column = (x - GRID_LEFT) / CELL_WIDTH;
+            let column = calendar_column(visual_column, app.settings.calendar_rtl);
+            let row = (y - GRID_TOP) / CELL_HEIGHT;
+            let cell = row * 7 + column;
+            let (primary, _) = adjacent_date(app.settings.main_calendar, app.year, app.month, cell);
+            let jalali = convert(primary, app.settings.main_calendar, CalendarKind::Jalali);
+            if app.events.events_for_day(jalali.year, jalali.month, jalali.day).is_empty() { None } else { Some(cell) }
+        } else {
+            None
+        };
+        let changed = app.hovered_cell != next;
+        app.hovered_cell = next;
+        changed
+    };
+    if changed { unsafe { InvalidateRect(hwnd, null(), 0); } }
 }
 
 fn secondary_day_text(kind: CalendarKind, day: u32) -> String {
@@ -693,6 +764,7 @@ unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Font
 }
 
 unsafe fn paint_update_banner(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts, footer_top: i32) {
+    if app.settings.auto_update { return; }
     let status = update::status();
     let (text, color) = match status {
         update::UpdateStatus::Available(info) => (
@@ -742,10 +814,13 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         paint_toggle_row(hdc, app, palette, fonts, 394, "نمایش عنوان تقویم‌های جانبی", app.settings.show_subtitles);
         paint_toggle_row(hdc, app, palette, fonts, 438, "نمایش بخش مناسبت‌ها", app.settings.show_events);
         paint_toggle_row(hdc, app, palette, fonts, 482, "نمایش تاریخ کامل در Tooltip", app.settings.show_tray_date);
-        paint_toggle_row(hdc, app, palette, fonts, 526, "اجرا همراه با ویندوز", app.settings.autostart);
+        paint_toggle_row(hdc, app, palette, fonts, 526, "بروزرسانی خودکار و بی‌صدا", app.settings.auto_update);
+        paint_toggle_row(hdc, app, palette, fonts, 570, "نمایش شماره روز روی آیکن Tray", app.settings.tray_day_icon);
+        paint_toggle_row(hdc, app, palette, fonts, 614, "نمایش ویجت تاریخ کنار تسکبار", app.settings.taskbar_widget);
+        paint_toggle_row(hdc, app, palette, fonts, 658, "اجرا همراه با ویندوز", app.settings.autostart);
 
-        draw_round_fill(hdc, sr(RECT { left: 24, top: 581, right: 406, bottom: 623 }), palette.accent, scaled(12, scale));
-        draw_text(hdc, "بازنشانی تنظیمات", sr(RECT { left: 24, top: 581, right: 406, bottom: 623 }), palette.accent_text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        draw_round_fill(hdc, sr(RECT { left: 24, top: 713, right: 406, bottom: 755 }), palette.accent, scaled(12, scale));
+        draw_text(hdc, "بازنشانی تنظیمات", sr(RECT { left: 24, top: 713, right: 406, bottom: 755 }), palette.accent_text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         paint_footer(hdc, app, palette, fonts);
     }
 }
@@ -795,6 +870,9 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
     let mut show_about_dialog = false;
     let mut open_website_link = false;
     let mut refresh_tooltip = false;
+    let mut refresh_tray_visual = false;
+    let mut refresh_taskbar_widget = false;
+    let mut enable_auto_update = false;
     let mut start_update = false;
     let mut update_release_url = None;
     let mut resize = false;
@@ -805,7 +883,7 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
         let footer_top = app.base_height() - BASE_FOOTER_HEIGHT;
         if y >= footer_top {
             open_website_link = true;
-        } else if update::banner_visible() && y >= footer_top - BASE_UPDATE_HEIGHT {
+        } else if !app.settings.auto_update && update::banner_visible() && y >= footer_top - BASE_UPDATE_HEIGHT {
             match update::status() {
                 update::UpdateStatus::Available(_) => start_update = true,
                 update::UpdateStatus::Failed(info) => update_release_url = Some(info.release_url),
@@ -907,13 +985,26 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                     app.settings.show_tray_date = !app.settings.show_tray_date;
                     app.settings.save();
                     refresh_tooltip = true;
-                } else if (524..=570).contains(&y) {
+                } else if (524..=568).contains(&y) {
+                    app.settings.auto_update = !app.settings.auto_update;
+                    enable_auto_update = app.settings.auto_update;
+                    app.settings.save();
+                    resize = true;
+                } else if (569..=612).contains(&y) {
+                    app.settings.tray_day_icon = !app.settings.tray_day_icon;
+                    app.settings.save();
+                    refresh_tray_visual = true;
+                } else if (613..=656).contains(&y) {
+                    app.settings.taskbar_widget = !app.settings.taskbar_widget;
+                    app.settings.save();
+                    refresh_taskbar_widget = true;
+                } else if (657..=704).contains(&y) {
                     let next = !app.settings.autostart;
                     if set_autostart(next) {
                         app.settings.autostart = next;
                         app.settings.save();
                     }
-                } else if (574..=634).contains(&y) {
+                } else if (706..=766).contains(&y) {
                     let default_settings = Settings::default();
                     let next_main = default_settings.main_calendar;
                     if next_main != app.settings.main_calendar {
@@ -926,6 +1017,9 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                     app.settings.save();
                     resize = true;
                     refresh_tooltip = true;
+                    refresh_tray_visual = true;
+                    refresh_taskbar_widget = true;
+                    enable_auto_update = app.settings.auto_update;
                 }
             }
         }}
@@ -935,6 +1029,11 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
     if show_about_dialog { unsafe { show_about(hwnd); } }
     if open_website_link { unsafe { open_website(hwnd); } }
     if refresh_tooltip { unsafe { refresh_tray_tooltip(hwnd); } }
+    if refresh_tray_visual { unsafe { refresh_tray_icon(hwnd); } }
+    if refresh_taskbar_widget { unsafe { update_taskbar_widget(hwnd); } }
+    if enable_auto_update && matches!(update::status(), update::UpdateStatus::Available(_)) {
+        update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE);
+    }
     if start_update { update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE); }
     if let Some(url) = update_release_url { unsafe { open_url(hwnd, &url); } }
 }
@@ -1012,6 +1111,56 @@ unsafe fn load_app_icon(instance: HINSTANCE) -> HICON {
     unsafe { LoadIconW(instance, APP_ICON_ID as *const u16) }
 }
 
+unsafe fn create_tray_day_icon(day: u32) -> HICON {
+    unsafe {
+        let screen = GetDC(null_mut());
+        if screen.is_null() { return null_mut(); }
+        let dc = CreateCompatibleDC(screen);
+        let color = CreateCompatibleBitmap(screen, 32, 32);
+        let mask = CreateBitmap(32, 32, 1, 1, null());
+        if dc.is_null() || color.is_null() || mask.is_null() {
+            if !dc.is_null() { DeleteDC(dc); }
+            if !color.is_null() { DeleteObject(color as HGDIOBJ); }
+            if !mask.is_null() { DeleteObject(mask as HGDIOBJ); }
+            ReleaseDC(null_mut(), screen);
+            return null_mut();
+        }
+        let old_bitmap = SelectObject(dc, color as HGDIOBJ);
+        fill_rect_color(dc, RECT { left: 0, top: 0, right: 32, bottom: 32 }, rgb(248, 211, 88));
+        draw_round_fill(dc, RECT { left: 1, top: 1, right: 31, bottom: 31 }, rgb(248, 211, 88), 7);
+        let font = create_font(-22, FW_BOLD as i32, "Vazirmatn");
+        draw_text(
+            dc,
+            &persian_digits(day),
+            RECT { left: 0, top: 0, right: 32, bottom: 31 },
+            rgb(30, 31, 33),
+            font,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+        );
+        DeleteObject(font as HGDIOBJ);
+        SelectObject(dc, old_bitmap);
+        DeleteDC(dc);
+        ReleaseDC(null_mut(), screen);
+
+        let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+        let icon = CreateIconIndirect(&info);
+        DeleteObject(mask as HGDIOBJ);
+        DeleteObject(color as HGDIOBJ);
+        icon
+    }
+}
+
+unsafe fn selected_tray_icon(app: &AppState) -> (HICON, bool) {
+    unsafe {
+        if app.settings.tray_day_icon {
+            let today = from_gregorian(CalendarKind::Jalali, app.today_gregorian);
+            let icon = create_tray_day_icon(today.day);
+            if !icon.is_null() { return (icon, true); }
+        }
+        (load_app_icon(GetModuleHandleW(null())), false)
+    }
+}
+
 unsafe fn open_website(hwnd: HWND) {
     unsafe { open_url(hwnd, WEBSITE_URL); }
 }
@@ -1026,17 +1175,19 @@ unsafe fn open_url(hwnd: HWND, address: &str) {
 
 unsafe fn add_tray_icon(hwnd: HWND) {
     unsafe {
+        let (icon, custom) = selected_tray_icon(&state().lock().unwrap());
         let mut data: NOTIFYICONDATAW = zeroed();
         data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
         data.uID = TRAY_ID;
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
-        data.hIcon = load_app_icon(GetModuleHandleW(null()));
+        data.hIcon = icon;
         let tip = wide(&tray_tooltip(&state().lock().unwrap()));
         let count = tip.len().min(data.szTip.len());
         data.szTip[..count].copy_from_slice(&tip[..count]);
         Shell_NotifyIconW(NIM_ADD, &data);
+        if custom { CUSTOM_TRAY_ICON.store(icon as isize, Ordering::SeqCst); }
     }
 }
 
@@ -1073,6 +1224,21 @@ unsafe fn refresh_tray_tooltip(hwnd: HWND) {
     }
 }
 
+unsafe fn refresh_tray_icon(hwnd: HWND) {
+    unsafe {
+        let (icon, custom) = selected_tray_icon(&state().lock().unwrap());
+        let mut data: NOTIFYICONDATAW = zeroed();
+        data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uID = TRAY_ID;
+        data.uFlags = NIF_ICON;
+        data.hIcon = icon;
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+        let previous = CUSTOM_TRAY_ICON.swap(if custom { icon as isize } else { 0 }, Ordering::SeqCst) as HICON;
+        if !previous.is_null() { DestroyIcon(previous); }
+    }
+}
+
 unsafe fn remove_tray_icon(hwnd: HWND) {
     unsafe {
         let mut data: NOTIFYICONDATAW = zeroed();
@@ -1080,6 +1246,116 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
         data.hWnd = hwnd;
         data.uID = TRAY_ID;
         Shell_NotifyIconW(NIM_DELETE, &data);
+        let custom = CUSTOM_TRAY_ICON.swap(0, Ordering::SeqCst) as HICON;
+        if !custom.is_null() { DestroyIcon(custom); }
+    }
+}
+
+unsafe fn taskbar_widget_position() -> Option<(i32, i32, i32, i32)> {
+    unsafe {
+        let taskbar_class = wide("Shell_TrayWnd");
+        let taskbar = FindWindowW(taskbar_class.as_ptr(), null());
+        if taskbar.is_null() { return None; }
+        let mut taskbar_rect: RECT = zeroed();
+        if GetWindowRect(taskbar, &mut taskbar_rect) == 0 { return None; }
+        let horizontal = taskbar_rect.right - taskbar_rect.left >= taskbar_rect.bottom - taskbar_rect.top;
+        if horizontal {
+            let tray_class = wide("TrayNotifyWnd");
+            let tray = FindWindowExW(taskbar, null_mut(), tray_class.as_ptr(), null());
+            let mut tray_rect: RECT = zeroed();
+            let tray_left = if !tray.is_null() && GetWindowRect(tray, &mut tray_rect) != 0 {
+                tray_rect.left
+            } else {
+                taskbar_rect.right
+            };
+            let width = 112;
+            let height = (taskbar_rect.bottom - taskbar_rect.top - 8).clamp(28, 40);
+            Some((tray_left - width - 6, taskbar_rect.top + ((taskbar_rect.bottom - taskbar_rect.top - height) / 2), width, height))
+        } else {
+            let width = (taskbar_rect.right - taskbar_rect.left - 8).clamp(32, 64);
+            Some((taskbar_rect.left + 4, taskbar_rect.bottom - 50, width, 42))
+        }
+    }
+}
+
+unsafe fn update_taskbar_widget(owner: HWND) {
+    unsafe {
+        TASKBAR_WIDGET_OWNER.store(owner as isize, Ordering::SeqCst);
+        let enabled = state().lock().unwrap().settings.taskbar_widget;
+        let mut widget = TASKBAR_WIDGET_HWND.load(Ordering::SeqCst) as HWND;
+        if !enabled {
+            if !widget.is_null() && IsWindow(widget) != 0 { DestroyWindow(widget); }
+            return;
+        }
+        let Some((x, y, width, height)) = taskbar_widget_position() else { return; };
+        if widget.is_null() || IsWindow(widget) == 0 {
+            let instance = GetModuleHandleW(null());
+            let class_name = wide(TASKBAR_WIDGET_CLASS);
+            let title = wide(APP_NAME);
+            widget = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                class_name.as_ptr(), title.as_ptr(), WS_POPUP,
+                x, y, width, height,
+                null_mut(), null_mut(), instance, null(),
+            );
+            if widget.is_null() { return; }
+            TASKBAR_WIDGET_HWND.store(widget as isize, Ordering::SeqCst);
+        }
+        SetWindowPos(widget, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(widget, null(), 0);
+    }
+}
+
+unsafe fn paint_taskbar_widget(hwnd: HWND) {
+    unsafe {
+        let mut ps: PAINTSTRUCT = zeroed();
+        let window_dc = BeginPaint(hwnd, &mut ps);
+        if window_dc.is_null() { return; }
+        let mut rect: RECT = zeroed();
+        GetClientRect(hwnd, &mut rect);
+        let dc = CreateCompatibleDC(window_dc);
+        let bitmap = CreateCompatibleBitmap(window_dc, rect.right, rect.bottom);
+        if dc.is_null() || bitmap.is_null() {
+            if !dc.is_null() { DeleteDC(dc); }
+            if !bitmap.is_null() { DeleteObject(bitmap as HGDIOBJ); }
+            EndPaint(hwnd, &ps);
+            return;
+        }
+        let old_bitmap = SelectObject(dc, bitmap as HGDIOBJ);
+        let app = state().lock().unwrap();
+        let palette = Palette::from_theme(app.settings.theme);
+        let today = from_gregorian(CalendarKind::Jalali, app.today_gregorian);
+        let text = format!("{}/{:02}/{:02}", persian_digits(today.year), today.month, today.day);
+        draw_round_fill(dc, rect, palette.surface, 9);
+        draw_round_outline(dc, RECT { left: 0, top: 0, right: rect.right - 1, bottom: rect.bottom - 1 }, palette.accent, 9, 1);
+        let font = create_font(-14, FW_SEMIBOLD as i32, "Vazirmatn");
+        draw_text(dc, &persian_digits(text), RECT { left: 5, top: 0, right: rect.right - 5, bottom: rect.bottom }, palette.text, font, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        DeleteObject(font as HGDIOBJ);
+        drop(app);
+        BitBlt(window_dc, 0, 0, rect.right, rect.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old_bitmap);
+        DeleteObject(bitmap as HGDIOBJ);
+        DeleteDC(dc);
+        EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe extern "system" fn taskbar_widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => { unsafe { paint_taskbar_widget(hwnd); } 0 }
+        WM_ERASEBKGND => 1,
+        WM_LBUTTONUP => {
+            let owner = TASKBAR_WIDGET_OWNER.load(Ordering::SeqCst) as HWND;
+            if !owner.is_null() { unsafe { show_popup(owner); } }
+            0
+        }
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            let owner = TASKBAR_WIDGET_OWNER.load(Ordering::SeqCst) as HWND;
+            if !owner.is_null() { unsafe { update_taskbar_widget(owner); } }
+            0
+        }
+        WM_DESTROY => { TASKBAR_WIDGET_HWND.store(0, Ordering::SeqCst); 0 }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
@@ -1172,13 +1448,23 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
-            unsafe { add_tray_icon(hwnd); SetTimer(hwnd, DATE_REFRESH_TIMER_ID, 60_000, None); resize_main_window(hwnd, false); }
+            unsafe {
+                add_tray_icon(hwnd);
+                update_taskbar_widget(hwnd);
+                SetTimer(hwnd, DATE_REFRESH_TIMER_ID, 60_000, None);
+                resize_main_window(hwnd, false);
+            }
             update::start_check(hwnd, WM_UPDATE_STATUS);
             0
         }
         WM_PAINT => { unsafe { paint_main(hwnd); } 0 }
         WM_ERASEBKGND => 1,
         WM_UPDATE_STATUS => {
+            if state().lock().unwrap().settings.auto_update
+                && matches!(update::status(), update::UpdateStatus::Available(_))
+            {
+                update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE);
+            }
             unsafe { resize_main_window(hwnd, true); InvalidateRect(hwnd, null(), 0); }
             0
         }
@@ -1197,9 +1483,39 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
             unsafe { copy_date_at_point(hwnd, x, y); }
             0
         }
+        WM_MOUSEMOVE => {
+            let (x, y) = point_from_lparam(lparam);
+            unsafe {
+                update_day_hover(hwnd, x, y);
+                let mut tracking = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                TrackMouseEvent(&mut tracking);
+            }
+            0
+        }
+        WM_MOUSE_LEAVE => {
+            let changed = {
+                let mut app = state().lock().unwrap();
+                let changed = app.hovered_cell.take().is_some();
+                changed
+            };
+            if changed { unsafe { InvalidateRect(hwnd, null(), 0); } }
+            0
+        }
         WM_TIMER if wparam == DATE_REFRESH_TIMER_ID => {
             let changed = state().lock().unwrap().refresh_today();
-            if changed { unsafe { refresh_tray_tooltip(hwnd); InvalidateRect(hwnd, null(), 0); } }
+            if changed {
+                unsafe {
+                    refresh_tray_tooltip(hwnd);
+                    refresh_tray_icon(hwnd);
+                    update_taskbar_widget(hwnd);
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
             0
         }
         WM_MOUSEWHEEL => {
@@ -1279,7 +1595,13 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
             0
         }
         WM_DESTROY => {
-            unsafe { KillTimer(hwnd, DATE_REFRESH_TIMER_ID); remove_tray_icon(hwnd); PostQuitMessage(0); }
+            unsafe {
+                KillTimer(hwnd, DATE_REFRESH_TIMER_ID);
+                let widget = TASKBAR_WIDGET_HWND.load(Ordering::SeqCst) as HWND;
+                if !widget.is_null() && IsWindow(widget) != 0 { DestroyWindow(widget); }
+                remove_tray_icon(hwnd);
+                PostQuitMessage(0);
+            }
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -1375,6 +1697,7 @@ fn register_window_classes(instance: HINSTANCE) -> bool {
     unsafe {
         let main_class_name = wide(MAIN_CLASS);
         let about_class_name = wide(ABOUT_CLASS);
+        let widget_class_name = wide(TASKBAR_WIDGET_CLASS);
         let main_class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW | CS_DBLCLKS,
             lpfnWndProc: Some(main_window_proc),
@@ -1399,7 +1722,21 @@ fn register_window_classes(instance: HINSTANCE) -> bool {
             lpszMenuName: null(),
             lpszClassName: about_class_name.as_ptr(),
         };
-        RegisterClassW(&main_class) != 0 && RegisterClassW(&about_class) != 0
+        let widget_class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+            lpfnWndProc: Some(taskbar_widget_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: instance,
+            hIcon: load_app_icon(instance),
+            hCursor: LoadCursorW(null_mut(), IDC_HAND),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: widget_class_name.as_ptr(),
+        };
+        RegisterClassW(&main_class) != 0
+            && RegisterClassW(&about_class) != 0
+            && RegisterClassW(&widget_class) != 0
     }
 }
 

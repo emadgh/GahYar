@@ -45,6 +45,9 @@ pub struct Settings {
     pub show_subtitles: bool,
     pub show_events: bool,
     pub show_tray_date: bool,
+    pub auto_update: bool,
+    pub tray_day_icon: bool,
+    pub taskbar_widget: bool,
     pub autostart: bool,
 }
 
@@ -61,6 +64,9 @@ impl Default for Settings {
             show_subtitles: true,
             show_events: true,
             show_tray_date: true,
+            auto_update: true,
+            tray_day_icon: false,
+            taskbar_widget: false,
             autostart: false,
         }
     }
@@ -83,6 +89,9 @@ impl Settings {
                     "show_subtitles" => settings.show_subtitles = parse_bool(value),
                     "show_events" => settings.show_events = parse_bool(value),
                     "show_tray_date" => settings.show_tray_date = parse_bool(value),
+                    "auto_update" => settings.auto_update = parse_bool(value),
+                    "tray_day_icon" => settings.tray_day_icon = parse_bool(value),
+                    "taskbar_widget" => settings.taskbar_widget = parse_bool(value),
                     "autostart" => settings.autostart = parse_bool(value),
                     _ => {}
                 }
@@ -97,7 +106,7 @@ impl Settings {
         let path = settings_path();
         if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
         let text = format!(
-            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nautostart={}\n",
+            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\ntaskbar_widget={}\nautostart={}\n",
             self.theme.key(),
             self.ui_scale,
             self.main_calendar.key(),
@@ -108,6 +117,9 @@ impl Settings {
             self.show_subtitles,
             self.show_events,
             self.show_tray_date,
+            self.auto_update,
+            self.tray_day_icon,
+            self.taskbar_widget,
             self.autostart,
         );
         let _ = fs::write(path, text);
