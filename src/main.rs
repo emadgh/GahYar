@@ -24,6 +24,7 @@ use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::*;
+use windows_sys::Win32::UI::Controls::DrawThemeParentBackground;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -75,6 +76,7 @@ static MANUAL_UPDATE_REQUEST: AtomicBool = AtomicBool::new(false);
 static ABOUT_HWND: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_WIDGET_OWNER: AtomicIsize = AtomicIsize::new(0);
+static TASKBAR_WIDGET_HOVER: AtomicBool = AtomicBool::new(false);
 static CUSTOM_TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
 static FONT_RESOURCE_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
@@ -160,6 +162,14 @@ fn state() -> &'static Mutex<AppState> {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn taskbar_created_message() -> u32 {
+    static MESSAGE: OnceLock<u32> = OnceLock::new();
+    *MESSAGE.get_or_init(|| unsafe {
+        let name = wide("TaskbarCreated");
+        RegisterWindowMessageW(name.as_ptr())
+    })
 }
 
 fn persian_digits(value: impl ToString) -> String {
@@ -1191,7 +1201,8 @@ unsafe fn add_tray_icon(hwnd: HWND) {
         let count = tip.len().min(data.szTip.len());
         data.szTip[..count].copy_from_slice(&tip[..count]);
         Shell_NotifyIconW(NIM_ADD, &data);
-        if custom { CUSTOM_TRAY_ICON.store(icon as isize, Ordering::SeqCst); }
+        let previous = CUSTOM_TRAY_ICON.swap(if custom { icon as isize } else { 0 }, Ordering::SeqCst) as HICON;
+        if !previous.is_null() { DestroyIcon(previous); }
     }
 }
 
@@ -1255,7 +1266,7 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
     }
 }
 
-unsafe fn taskbar_widget_position() -> Option<(i32, i32, i32, i32)> {
+unsafe fn taskbar_widget_position() -> Option<(HWND, i32, i32, i32, i32)> {
     unsafe {
         let taskbar_class = wide("Shell_TrayWnd");
         let taskbar = FindWindowW(taskbar_class.as_ptr(), null());
@@ -1272,12 +1283,15 @@ unsafe fn taskbar_widget_position() -> Option<(i32, i32, i32, i32)> {
             } else {
                 taskbar_rect.right
             };
-            let width = 112;
-            let height = (taskbar_rect.bottom - taskbar_rect.top - 8).clamp(28, 40);
-            Some((tray_left - width - 6, taskbar_rect.top + ((taskbar_rect.bottom - taskbar_rect.top - height) / 2), width, height))
+            let width = 126;
+            let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+            let height = taskbar_height.clamp(32, 48);
+            let x = tray_left - taskbar_rect.left - width;
+            let y = (taskbar_height - height) / 2;
+            Some((taskbar, x.max(0), y, width, height))
         } else {
             let width = (taskbar_rect.right - taskbar_rect.left - 8).clamp(32, 64);
-            Some((taskbar_rect.left + 4, taskbar_rect.bottom - 50, width, 42))
+            Some((taskbar, 4, taskbar_rect.bottom - taskbar_rect.top - 50, width, 42))
         }
     }
 }
@@ -1291,21 +1305,23 @@ unsafe fn update_taskbar_widget(owner: HWND) {
             if !widget.is_null() && IsWindow(widget) != 0 { DestroyWindow(widget); }
             return;
         }
-        let Some((x, y, width, height)) = taskbar_widget_position() else { return; };
+        let Some((taskbar, x, y, width, height)) = taskbar_widget_position() else { return; };
         if widget.is_null() || IsWindow(widget) == 0 {
             let instance = GetModuleHandleW(null());
             let class_name = wide(TASKBAR_WIDGET_CLASS);
             let title = wide(APP_NAME);
             widget = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                class_name.as_ptr(), title.as_ptr(), WS_POPUP,
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class_name.as_ptr(), title.as_ptr(), WS_CHILD | WS_VISIBLE,
                 x, y, width, height,
-                null_mut(), null_mut(), instance, null(),
+                taskbar, null_mut(), instance, null(),
             );
             if widget.is_null() { return; }
             TASKBAR_WIDGET_HWND.store(widget as isize, Ordering::SeqCst);
+        } else if GetParent(widget) != taskbar {
+            SetParent(widget, taskbar);
         }
-        SetWindowPos(widget, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetWindowPos(widget, HWND_TOP, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         InvalidateRect(widget, null(), 0);
     }
 }
@@ -1326,14 +1342,22 @@ unsafe fn paint_taskbar_widget(hwnd: HWND) {
             return;
         }
         let old_bitmap = SelectObject(dc, bitmap as HGDIOBJ);
+        fill_rect_color(dc, rect, GetSysColor(COLOR_3DFACE));
+        DrawThemeParentBackground(hwnd, dc, &rect);
         let app = state().lock().unwrap();
-        let palette = Palette::from_theme(app.settings.theme);
         let today = from_gregorian(CalendarKind::Jalali, app.today_gregorian);
         let text = format!("{}/{:02}/{:02}", persian_digits(today.year), today.month, today.day);
-        draw_round_fill(dc, rect, palette.surface, 9);
-        draw_round_outline(dc, RECT { left: 0, top: 0, right: rect.right - 1, bottom: rect.bottom - 1 }, palette.accent, 9, 1);
+        let sample = GetPixel(dc, (rect.right / 2).max(0), (rect.bottom / 2).max(0));
+        let red = sample & 0xff;
+        let green = (sample >> 8) & 0xff;
+        let blue = (sample >> 16) & 0xff;
+        let luminance = red * 299 + green * 587 + blue * 114;
+        let text_color = if luminance > 145_000 { rgb(24, 24, 24) } else { rgb(245, 245, 245) };
+        if TASKBAR_WIDGET_HOVER.load(Ordering::SeqCst) {
+            draw_round_outline(dc, RECT { left: 2, top: 2, right: rect.right - 2, bottom: rect.bottom - 2 }, text_color, 7, 1);
+        }
         let font = create_font(-14, FW_SEMIBOLD as i32, "Vazirmatn");
-        draw_text(dc, &persian_digits(text), RECT { left: 5, top: 0, right: rect.right - 5, bottom: rect.bottom }, palette.text, font, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        draw_text(dc, &persian_digits(text), RECT { left: 5, top: 0, right: rect.right - 5, bottom: rect.bottom }, text_color, font, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         DeleteObject(font as HGDIOBJ);
         drop(app);
         BitBlt(window_dc, 0, 0, rect.right, rect.bottom, dc, 0, 0, SRCCOPY);
@@ -1348,6 +1372,26 @@ unsafe extern "system" fn taskbar_widget_proc(hwnd: HWND, msg: u32, wparam: WPAR
     match msg {
         WM_PAINT => { unsafe { paint_taskbar_widget(hwnd); } 0 }
         WM_ERASEBKGND => 1,
+        WM_MOUSEMOVE => {
+            if !TASKBAR_WIDGET_HOVER.swap(true, Ordering::SeqCst) {
+                unsafe { InvalidateRect(hwnd, null(), 0); }
+            }
+            unsafe {
+                let mut tracking = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                TrackMouseEvent(&mut tracking);
+            }
+            0
+        }
+        WM_MOUSE_LEAVE => {
+            TASKBAR_WIDGET_HOVER.store(false, Ordering::SeqCst);
+            unsafe { InvalidateRect(hwnd, null(), 0); }
+            0
+        }
         WM_LBUTTONUP => {
             let owner = TASKBAR_WIDGET_OWNER.load(Ordering::SeqCst) as HWND;
             if !owner.is_null() { unsafe { show_popup(owner); } }
@@ -1358,7 +1402,11 @@ unsafe extern "system" fn taskbar_widget_proc(hwnd: HWND, msg: u32, wparam: WPAR
             if !owner.is_null() { unsafe { update_taskbar_widget(owner); } }
             0
         }
-        WM_DESTROY => { TASKBAR_WIDGET_HWND.store(0, Ordering::SeqCst); 0 }
+        WM_DESTROY => {
+            TASKBAR_WIDGET_HOVER.store(false, Ordering::SeqCst);
+            TASKBAR_WIDGET_HWND.store(0, Ordering::SeqCst);
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
@@ -1628,6 +1676,13 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK => unsafe { toggle_popup(hwnd); },
                 WM_RBUTTONUP | WM_CONTEXTMENU => unsafe { show_tray_menu(hwnd); },
                 _ => {}
+            }
+            0
+        }
+        _ if msg == taskbar_created_message() => {
+            unsafe {
+                add_tray_icon(hwnd);
+                update_taskbar_widget(hwnd);
             }
             0
         }
