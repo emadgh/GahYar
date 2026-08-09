@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Local runtime data and logs
+*.log
+*.tmp
+*.bak
+/iran-calendar-events-1405.json
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local environment files
+.env
+.env.*
+!.env.example
