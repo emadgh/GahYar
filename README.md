@@ -6,6 +6,12 @@
 
 گاه‌یار یک تقویم فارسی سبک و بومی برای Windows است که با Rust و Win32 نوشته شده و از System Tray در دسترس قرار می‌گیرد.
 
+## نمای برنامه
+
+<p align="center">
+  <img src="screenshot.jpg" width="100%" alt="نمای تقویم روشن و تیره و صفحه تنظیمات گاه‌یار">
+</p>
+
 ## دریافت برنامه
 
 آخرین نسخه `GahYar.exe` را از صفحه [Releases](https://github.com/emadgh/GahYar/releases/latest) دریافت کنید. برنامه قابل‌حمل است و نیازی به نصب ندارد.
