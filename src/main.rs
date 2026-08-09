@@ -40,7 +40,7 @@ const BASE_FOOTER_HEIGHT: i32 = 30;
 const BASE_UPDATE_HEIGHT: i32 = 42;
 const BASE_SETTINGS_HEIGHT: i32 = 790;
 const BASE_ABOUT_WIDTH: i32 = 380;
-const BASE_ABOUT_HEIGHT: i32 = 250;
+const BASE_ABOUT_HEIGHT: i32 = 300;
 
 const GRID_LEFT: i32 = 18;
 const GRID_TOP: i32 = 159;
@@ -59,8 +59,11 @@ const TRAY_ID: u32 = 1;
 const CMD_OPEN: usize = 1001;
 const CMD_SETTINGS: usize = 1002;
 const CMD_ABOUT: usize = 1003;
+const CMD_UPDATE: usize = 1004;
 const CMD_EXIT: usize = 1005;
 const DATE_REFRESH_TIMER_ID: usize = 1;
+const UPDATE_CHECK_TIMER_ID: usize = 2;
+const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1000;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const INSTANCE_MUTEX_NAME: &str = "Local\\GahYar.SingleInstance";
 const FONT_RESOURCE_ID: usize = 101;
@@ -68,6 +71,7 @@ const RCDATA_RESOURCE_TYPE: usize = 10;
 
 static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 static EXITING: AtomicBool = AtomicBool::new(false);
+static MANUAL_UPDATE_REQUEST: AtomicBool = AtomicBool::new(false);
 static ABOUT_HWND: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_WIDGET_OWNER: AtomicIsize = AtomicIsize::new(0);
@@ -1410,6 +1414,21 @@ unsafe fn toggle_popup(hwnd: HWND) {
     }
 }
 
+fn request_manual_update(hwnd: HWND) {
+    MANUAL_UPDATE_REQUEST.store(true, Ordering::SeqCst);
+    match update::status() {
+        update::UpdateStatus::Available(_) | update::UpdateStatus::Failed(_) => {
+            if update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE) {
+                MANUAL_UPDATE_REQUEST.store(false, Ordering::SeqCst);
+            }
+        }
+        update::UpdateStatus::Checking | update::UpdateStatus::Downloading => {}
+        _ => {
+            update::start_check(hwnd, WM_UPDATE_STATUS);
+        }
+    }
+}
+
 unsafe fn show_tray_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu();
@@ -1417,10 +1436,12 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         let open = wide("باز کردن گاه‌یار");
         let settings_text = wide("تنظیمات");
         let about = wide("درباره گاه‌یار");
+        let update_text = wide("بررسی بروزرسانی");
         let exit = wide("خروج");
         AppendMenuW(menu, MF_STRING, CMD_OPEN, open.as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_SETTINGS, settings_text.as_ptr());
         AppendMenuW(menu, MF_STRING, CMD_ABOUT, about.as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_UPDATE, update_text.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, CMD_EXIT, exit.as_ptr());
         let mut point: POINT = zeroed();
@@ -1436,6 +1457,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
                 show_popup(hwnd);
             }
             CMD_ABOUT => show_about(hwnd),
+            CMD_UPDATE => request_manual_update(hwnd),
             CMD_EXIT => {
                 EXITING.store(true, Ordering::SeqCst);
                 DestroyWindow(hwnd);
@@ -1452,6 +1474,7 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
                 add_tray_icon(hwnd);
                 update_taskbar_widget(hwnd);
                 SetTimer(hwnd, DATE_REFRESH_TIMER_ID, 60_000, None);
+                SetTimer(hwnd, UPDATE_CHECK_TIMER_ID, UPDATE_CHECK_INTERVAL_MS, None);
                 resize_main_window(hwnd, false);
             }
             update::start_check(hwnd, WM_UPDATE_STATUS);
@@ -1460,12 +1483,22 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
         WM_PAINT => { unsafe { paint_main(hwnd); } 0 }
         WM_ERASEBKGND => 1,
         WM_UPDATE_STATUS => {
-            if state().lock().unwrap().settings.auto_update
-                && matches!(update::status(), update::UpdateStatus::Available(_))
+            let status = update::status();
+            let manual = MANUAL_UPDATE_REQUEST.load(Ordering::SeqCst);
+            if matches!(status, update::UpdateStatus::Available(_))
+                && (state().lock().unwrap().settings.auto_update || manual)
+                && update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE)
             {
-                update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE);
+                MANUAL_UPDATE_REQUEST.store(false, Ordering::SeqCst);
+            } else if matches!(status, update::UpdateStatus::UpToDate | update::UpdateStatus::Idle | update::UpdateStatus::Failed(_)) {
+                MANUAL_UPDATE_REQUEST.store(false, Ordering::SeqCst);
             }
-            unsafe { resize_main_window(hwnd, true); InvalidateRect(hwnd, null(), 0); }
+            unsafe {
+                resize_main_window(hwnd, true);
+                InvalidateRect(hwnd, null(), 0);
+                let about = ABOUT_HWND.load(Ordering::SeqCst) as HWND;
+                if !about.is_null() && IsWindow(about) != 0 { InvalidateRect(about, null(), 0); }
+            }
             0
         }
         WM_APPLY_UPDATE => {
@@ -1516,6 +1549,10 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
                     InvalidateRect(hwnd, null(), 0);
                 }
             }
+            0
+        }
+        WM_TIMER if wparam == UPDATE_CHECK_TIMER_ID => {
+            update::start_check(hwnd, WM_UPDATE_STATUS);
             0
         }
         WM_MOUSEWHEEL => {
@@ -1597,6 +1634,7 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
         WM_DESTROY => {
             unsafe {
                 KillTimer(hwnd, DATE_REFRESH_TIMER_ID);
+                KillTimer(hwnd, UPDATE_CHECK_TIMER_ID);
                 let widget = TASKBAR_WIDGET_HWND.load(Ordering::SeqCst) as HWND;
                 if !widget.is_null() && IsWindow(widget) != 0 { DestroyWindow(widget); }
                 remove_tray_icon(hwnd);
@@ -1659,8 +1697,18 @@ unsafe fn paint_about(hwnd: HWND) {
         draw_text(hdc, "نوشته شده توسط عماد قاسمی", scaled_rect(RECT { left: 34, top: 58, right: 346, bottom: 94 }, scale), palette.text, fonts.regular, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         draw_text(hdc, "emadghasemi.ir", scaled_rect(RECT { left: 34, top: 96, right: 346, bottom: 132 }, scale), palette.accent, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         draw_text(hdc, &format!("نسخه {}", persian_digits(env!("CARGO_PKG_VERSION"))), scaled_rect(RECT { left: 34, top: 136, right: 346, bottom: 172 }, scale), palette.muted, fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
-        draw_round_fill(hdc, scaled_rect(RECT { left: 110, top: 190, right: 270, bottom: 228 }, scale), palette.accent, scaled(12, scale));
-        draw_text(hdc, "بستن", scaled_rect(RECT { left: 110, top: 190, right: 270, bottom: 228 }, scale), palette.accent_text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        let update_text = match update::status() {
+            update::UpdateStatus::Checking => "در حال بررسی…",
+            update::UpdateStatus::Downloading => "در حال بروزرسانی…",
+            update::UpdateStatus::UpToDate => "برنامه بروز است",
+            update::UpdateStatus::Available(_) => "دریافت نسخه جدید",
+            update::UpdateStatus::Failed(_) => "تلاش دوباره برای بروزرسانی",
+            _ => "بررسی بروزرسانی",
+        };
+        draw_round_fill(hdc, scaled_rect(RECT { left: 70, top: 184, right: 310, bottom: 224 }, scale), palette.surface_alt, scaled(12, scale));
+        draw_text(hdc, update_text, scaled_rect(RECT { left: 70, top: 184, right: 310, bottom: 224 }, scale), palette.accent, fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        draw_round_fill(hdc, scaled_rect(RECT { left: 110, top: 242, right: 270, bottom: 280 }, scale), palette.accent, scaled(12, scale));
+        draw_text(hdc, "بستن", scaled_rect(RECT { left: 110, top: 242, right: 270, bottom: 280 }, scale), palette.accent_text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         draw_round_outline(hdc, RECT { left: 0, top: 0, right: width - 1, bottom: height - 1 }, palette.border, scaled(18, scale), 1);
         drop(app);
         fonts.destroy();
@@ -1676,9 +1724,13 @@ unsafe extern "system" fn about_window_proc(hwnd: HWND, msg: u32, _wparam: WPARA
             let scale = state().lock().unwrap().scale();
             let x = unscaled(x, scale);
             let y = unscaled(y, scale);
-            if (30..=350).contains(&x) && (102..=170).contains(&y) {
+            if (30..=350).contains(&x) && (96..=132).contains(&y) {
                 unsafe { open_website(hwnd); }
-            } else if (100..=280).contains(&x) && (184..=236).contains(&y) {
+            } else if (60..=320).contains(&x) && (178..=232).contains(&y) {
+                let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
+                if !owner.is_null() { request_manual_update(owner); }
+                unsafe { InvalidateRect(hwnd, null(), 0); }
+            } else if (100..=280).contains(&x) && (236..=288).contains(&y) {
                 unsafe { DestroyWindow(hwnd); }
             }
             0

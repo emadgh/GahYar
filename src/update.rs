@@ -71,8 +71,14 @@ pub fn banner_visible() -> bool {
     matches!(status(), UpdateStatus::Available(_) | UpdateStatus::Downloading | UpdateStatus::Failed(_))
 }
 
-pub fn start_check(hwnd: HWND, notify_message: u32) {
-    *status_cell().lock().unwrap() = UpdateStatus::Checking;
+pub fn start_check(hwnd: HWND, notify_message: u32) -> bool {
+    {
+        let mut status = status_cell().lock().unwrap();
+        if matches!(*status, UpdateStatus::Checking | UpdateStatus::Downloading) {
+            return false;
+        }
+        *status = UpdateStatus::Checking;
+    }
     let hwnd = hwnd as isize;
     std::thread::spawn(move || {
         let next = match check_latest_release() {
@@ -83,6 +89,7 @@ pub fn start_check(hwnd: HWND, notify_message: u32) {
         *status_cell().lock().unwrap() = next;
         unsafe { PostMessageW(hwnd as HWND, notify_message, 0, 0); }
     });
+    true
 }
 
 pub fn start_download(hwnd: HWND, notify_message: u32, apply_message: u32) -> bool {
