@@ -5,7 +5,11 @@ mod events;
 mod settings;
 mod update;
 
+use std::fs;
+use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -18,21 +22,27 @@ use events::{CalendarEvent, EventStore};
 use settings::{set_autostart, Settings, Theme};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+};
 use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::{FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource};
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, SetFocus, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const APP_NAME: &str = "گاه‌یار";
 const WEBSITE_URL: &str = "https://emadghasemi.ir";
+const GITHUB_URL: &str = "https://github.com/emadgh/GahYar";
 const APP_ICON_ID: usize = 1;
 const MAIN_CLASS: &str = "GahYarMain";
 const ABOUT_CLASS: &str = "GahYarAbout";
-const TASKBAR_WIDGET_CLASS: &str = "GahYarTaskbarWidget";
+const CONFIRM_CLASS: &str = "GahYarConfirm";
 const BASE_WIDTH: i32 = 430;
 const BASE_HEIGHT_CALENDAR: i32 = 517;
 const BASE_EVENTS_HEIGHT: i32 = 136;
@@ -41,6 +51,8 @@ const BASE_UPDATE_HEIGHT: i32 = 42;
 const BASE_SETTINGS_HEIGHT: i32 = 790;
 const BASE_ABOUT_WIDTH: i32 = 380;
 const BASE_ABOUT_HEIGHT: i32 = 300;
+const BASE_CONFIRM_WIDTH: i32 = 430;
+const BASE_CONFIRM_HEIGHT: i32 = 350;
 
 const GRID_LEFT: i32 = 18;
 const GRID_TOP: i32 = 159;
@@ -65,7 +77,6 @@ const CMD_EXIT: usize = 1005;
 const DATE_REFRESH_TIMER_ID: usize = 1;
 const UPDATE_CHECK_TIMER_ID: usize = 2;
 const UPDATE_CHECK_INTERVAL_MS: u32 = 6 * 60 * 60 * 1000;
-const TASKBAR_WIDGET_TRANSPARENT_COLOR: COLORREF = 0x00ff00ff;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const INSTANCE_MUTEX_NAME: &str = "Local\\GahYar.SingleInstance";
 const FONT_RESOURCE_ID: usize = 101;
@@ -75,8 +86,7 @@ static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 static EXITING: AtomicBool = AtomicBool::new(false);
 static MANUAL_UPDATE_REQUEST: AtomicBool = AtomicBool::new(false);
 static ABOUT_HWND: AtomicIsize = AtomicIsize::new(0);
-static TASKBAR_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
-static TASKBAR_WIDGET_OWNER: AtomicIsize = AtomicIsize::new(0);
+static CONFIRM_HWND: AtomicIsize = AtomicIsize::new(0);
 static CUSTOM_TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
 static FONT_RESOURCE_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
@@ -96,6 +106,15 @@ struct AppState {
     view: ViewMode,
     event_scroll: usize,
     hovered_cell: Option<i32>,
+}
+
+struct ConfirmDialogState {
+    title: String,
+    message: String,
+    reminder: Option<String>,
+    accept_label: String,
+    destructive: bool,
+    accepted: bool,
 }
 
 impl AppState {
@@ -352,11 +371,19 @@ impl Fonts {
     }
 }
 
-fn main_month_heading(app: &AppState) -> String {
-    match app.settings.main_calendar {
-        CalendarKind::Gregorian => format!("{} {}", month_name(CalendarKind::Gregorian, app.month), app.year),
-        _ => format!("{} {}", month_name(app.settings.main_calendar, app.month), persian_digits(app.year)),
-    }
+fn main_date_heading(app: &AppState) -> String {
+    const WEEKDAYS: [&str; 7] = ["شنبه", "یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه"];
+    let today = app.today_main();
+    let day = app.selected_day.unwrap_or_else(|| {
+        if app.year == today.year && app.month == today.month { today.day } else { 1 }
+    });
+    let weekday = (first_weekday_saturday(app.settings.main_calendar, app.year, app.month)
+        + day as i32 - 1).rem_euclid(7) as usize;
+    let (day_text, year_text) = match app.settings.main_calendar {
+        CalendarKind::Gregorian => (day.to_string(), app.year.to_string()),
+        CalendarKind::Jalali | CalendarKind::Hijri => (persian_digits(day), persian_digits(app.year)),
+    };
+    format!("{}، {} {} {}", WEEKDAYS[weekday], day_text, month_name(app.settings.main_calendar, app.month), year_text)
 }
 
 fn secondary_ranges(app: &AppState) -> Vec<String> {
@@ -488,10 +515,10 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
 
         draw_text(
             hdc,
-            &main_month_heading(app),
+            &main_date_heading(app),
             sr(RECT { left: 72, top: 7, right: 358, bottom: 43 }),
             palette.accent,
-            fonts.title,
+            fonts.medium,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
 
@@ -507,8 +534,14 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         draw_text(hdc, "ⓘ", sr(RECT { left: 16, top: 56, right: 50, bottom: 88 }), palette.muted, fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         draw_round_fill(hdc, sr(RECT { left: 380, top: 57, right: 414, bottom: 89 }), palette.surface_alt, scaled(11, scale));
         draw_text(hdc, "⚙", sr(RECT { left: 380, top: 55, right: 414, bottom: 89 }), palette.muted, fonts.icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        draw_round_fill(hdc, sr(RECT { left: 174, top: 83, right: 256, bottom: 108 }), palette.accent, scaled(12, scale));
-        draw_text(hdc, "برو به امروز", sr(RECT { left: 174, top: 83, right: 256, bottom: 108 }), palette.accent_text, fonts.tiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        let today = app.today_main();
+        let today_is_active = app.year == today.year
+            && app.month == today.month
+            && app.selected_day == Some(today.day);
+        if !today_is_active {
+            draw_round_fill(hdc, sr(RECT { left: 174, top: 83, right: 256, bottom: 108 }), palette.accent, scaled(12, scale));
+            draw_text(hdc, "برو به امروز", sr(RECT { left: 174, top: 83, right: 256, bottom: 108 }), palette.accent_text, fonts.tiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        }
 
         // Weekday header.
         draw_round_fill(hdc, sr(RECT { left: GRID_LEFT, top: 116, right: GRID_LEFT + GRID_WIDTH, bottom: 150 }), palette.accent, scaled(10, scale));
@@ -768,8 +801,24 @@ unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Font
         paint_update_banner(hdc, app, palette, fonts, top);
         draw_text(
             hdc,
-            "نوشته شده توسط عماد قاسمی — emadghasemi.ir",
-            scaled_rect(RECT { left: 16, top, right: BASE_WIDTH - 16, bottom: top + BASE_FOOTER_HEIGHT - 3 }, scale),
+            "عماد قاسمی - emadghasemi.ir",
+            scaled_rect(RECT { left: 184, top, right: BASE_WIDTH - 12, bottom: top + BASE_FOOTER_HEIGHT - 3 }, scale),
+            palette.accent,
+            fonts.tiny,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+        );
+        draw_text(
+            hdc,
+            "|",
+            scaled_rect(RECT { left: 172, top, right: 184, bottom: top + BASE_FOOTER_HEIGHT - 3 }, scale),
+            palette.muted,
+            fonts.tiny,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        draw_text(
+            hdc,
+            &format!("گاه‌یار نسخه {}", persian_digits(env!("CARGO_PKG_VERSION"))),
+            scaled_rect(RECT { left: 10, top, right: 172, bottom: top + BASE_FOOTER_HEIGHT - 3 }, scale),
             palette.accent,
             fonts.tiny,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
@@ -828,11 +877,44 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         paint_toggle_row(hdc, app, palette, fonts, 394, "نمایش عنوان تقویم‌های جانبی", app.settings.show_subtitles);
         paint_toggle_row(hdc, app, palette, fonts, 438, "نمایش بخش مناسبت‌ها", app.settings.show_events);
         paint_toggle_row(hdc, app, palette, fonts, 482, "نمایش تاریخ کامل در Tooltip", app.settings.show_tray_date);
-        paint_toggle_row(hdc, app, palette, fonts, 526, "بروزرسانی خودکار و بی‌صدا", app.settings.auto_update);
+        paint_toggle_row(hdc, app, palette, fonts, 526, "بروزرسانی خودکار", app.settings.auto_update);
         paint_toggle_row(hdc, app, palette, fonts, 570, "نمایش شماره روز روی آیکن Tray", app.settings.tray_day_icon);
-        paint_toggle_row(hdc, app, palette, fonts, 614, "ویجت تسکبار (منسوخ و غیرفعال)", false);
-        paint_toggle_row(hdc, app, palette, fonts, 658, "اجرا همراه با ویندوز", app.settings.autostart);
+        paint_toggle_row(hdc, app, palette, fonts, 614, "اجرا همراه با ویندوز", app.settings.autostart);
 
+        let installation = installation_state();
+        let installed = installation != InstallationState::NotInstalled;
+        let install_label = match installation {
+            InstallationState::NotInstalled => "نصب در Program Files",
+            InstallationState::InstalledCurrent => "نصب شده",
+            InstallationState::UpdateAvailable => "بروزرسانی نسخه نصب‌شده",
+            InstallationState::InstalledOtherUpToDate => "نسخه نصب‌شده بروز است",
+        };
+        let install_color = match installation {
+            InstallationState::NotInstalled | InstallationState::UpdateAvailable => palette.accent,
+            InstallationState::InstalledCurrent | InstallationState::InstalledOtherUpToDate => palette.surface_alt,
+        };
+        let install_text_color = match installation {
+            InstallationState::NotInstalled | InstallationState::UpdateAvailable => palette.accent_text,
+            InstallationState::InstalledCurrent | InstallationState::InstalledOtherUpToDate => palette.muted,
+        };
+        draw_round_fill(hdc, sr(RECT { left: 218, top: 666, right: 406, bottom: 706 }), install_color, scaled(12, scale));
+        draw_text(
+            hdc,
+            install_label,
+            sr(RECT { left: 218, top: 666, right: 406, bottom: 706 }),
+            install_text_color,
+            fonts.small,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+        );
+        draw_round_fill(hdc, sr(RECT { left: 24, top: 666, right: 212, bottom: 706 }), if installed { palette.holiday } else { palette.surface_alt }, scaled(12, scale));
+        draw_text(
+            hdc,
+            "حذف برنامه",
+            sr(RECT { left: 24, top: 666, right: 212, bottom: 706 }),
+            if installed { palette.accent_text } else { palette.faint },
+            fonts.small,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+        );
         draw_round_fill(hdc, sr(RECT { left: 24, top: 713, right: 406, bottom: 755 }), palette.accent, scaled(12, scale));
         draw_text(hdc, "بازنشانی تنظیمات", sr(RECT { left: 24, top: 713, right: 406, bottom: 755 }), palette.accent_text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         paint_footer(hdc, app, palette, fonts);
@@ -883,10 +965,12 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
 unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
     let mut show_about_dialog = false;
     let mut open_website_link = false;
+    let mut open_github_link = false;
     let mut refresh_tooltip = false;
     let mut refresh_tray_visual = false;
-    let mut refresh_taskbar_widget = false;
     let mut enable_auto_update = false;
+    let mut install_requested = false;
+    let mut uninstall_requested = false;
     let mut start_update = false;
     let mut update_release_url = None;
     let mut resize = false;
@@ -896,7 +980,7 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
         let y = unscaled(y, app.scale());
         let footer_top = app.base_height() - BASE_FOOTER_HEIGHT;
         if y >= footer_top {
-            open_website_link = true;
+            if x >= 178 { open_website_link = true; } else { open_github_link = true; }
         } else if !app.settings.auto_update && update::banner_visible() && y >= footer_top - BASE_UPDATE_HEIGHT {
             match update::status() {
                 update::UpdateStatus::Available(_) => start_update = true,
@@ -928,10 +1012,15 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                     resize = true;
                 } else if (78..=113).contains(&y) && (160..=270).contains(&x) {
                     let today = app.today_main();
-                    app.year = today.year;
-                    app.month = today.month;
-                    app.selected_day = Some(today.day);
-                    app.event_scroll = 0;
+                    let today_is_active = app.year == today.year
+                        && app.month == today.month
+                        && app.selected_day == Some(today.day);
+                    if !today_is_active {
+                        app.year = today.year;
+                        app.month = today.month;
+                        app.selected_day = Some(today.day);
+                        app.event_scroll = 0;
+                    }
                 } else if (GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y)
                     && (GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
                 {
@@ -1008,17 +1097,21 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                     app.settings.tray_day_icon = !app.settings.tray_day_icon;
                     app.settings.save();
                     refresh_tray_visual = true;
-                } else if (613..=656).contains(&y) {
-                    app.settings.taskbar_widget = false;
-                    app.settings.save();
-                    refresh_taskbar_widget = true;
-                } else if (657..=704).contains(&y) {
+                } else if (613..=660).contains(&y) {
                     let next = !app.settings.autostart;
                     if set_autostart(next) {
                         app.settings.autostart = next;
                         app.settings.save();
                     }
-                } else if (706..=766).contains(&y) {
+                } else if (662..=710).contains(&y) {
+                    if x >= 215 {
+                        if matches!(installation_state(), InstallationState::NotInstalled | InstallationState::UpdateAvailable) {
+                            install_requested = true;
+                        }
+                    } else {
+                        uninstall_requested = true;
+                    }
+                } else if (711..=766).contains(&y) {
                     let default_settings = Settings::default();
                     let next_main = default_settings.main_calendar;
                     if next_main != app.settings.main_calendar {
@@ -1032,7 +1125,6 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                     resize = true;
                     refresh_tooltip = true;
                     refresh_tray_visual = true;
-                    refresh_taskbar_widget = true;
                     enable_auto_update = app.settings.auto_update;
                 }
             }
@@ -1042,9 +1134,19 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
     unsafe { InvalidateRect(hwnd, null(), 0); }
     if show_about_dialog { unsafe { show_about(hwnd); } }
     if open_website_link { unsafe { open_website(hwnd); } }
+    if open_github_link { unsafe { open_github(hwnd); } }
     if refresh_tooltip { unsafe { refresh_tray_tooltip(hwnd); } }
     if refresh_tray_visual { unsafe { refresh_tray_icon(hwnd); } }
-    if refresh_taskbar_widget { unsafe { update_taskbar_widget(hwnd); } }
+    if install_requested && unsafe { request_install(hwnd) } {
+        EXITING.store(true, Ordering::SeqCst);
+        unsafe { DestroyWindow(hwnd); }
+        return;
+    }
+    if uninstall_requested && unsafe { request_uninstall(hwnd) } {
+        EXITING.store(true, Ordering::SeqCst);
+        unsafe { DestroyWindow(hwnd); }
+        return;
+    }
     if enable_auto_update && matches!(update::status(), update::UpdateStatus::Available(_)) {
         update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE);
     }
@@ -1179,11 +1281,512 @@ unsafe fn open_website(hwnd: HWND) {
     unsafe { open_url(hwnd, WEBSITE_URL); }
 }
 
+unsafe fn open_github(hwnd: HWND) {
+    unsafe { open_url(hwnd, GITHUB_URL); }
+}
+
 unsafe fn open_url(hwnd: HWND, address: &str) {
     unsafe {
         let operation = wide("open");
         let url = wide(address);
         ShellExecuteW(hwnd, operation.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL);
+    }
+}
+
+fn installed_executable_path() -> Option<PathBuf> {
+    std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .map(|path| path.join("GahYar").join("GahYar.exe"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallationState {
+    NotInstalled,
+    InstalledCurrent,
+    UpdateAvailable,
+    InstalledOtherUpToDate,
+}
+
+fn same_executable_path(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+fn executable_version(path: &Path) -> Option<(u16, u16, u16, u16)> {
+    unsafe {
+        let path_wide = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let mut ignored = 0u32;
+        let size = GetFileVersionInfoSizeW(path_wide.as_ptr(), &mut ignored);
+        if size == 0 { return None; }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(path_wide.as_ptr(), 0, size, data.as_mut_ptr() as *mut c_void) == 0 {
+            return None;
+        }
+        let root = wide("\\");
+        let mut version_pointer: *mut c_void = null_mut();
+        let mut version_size = 0u32;
+        if VerQueryValueW(
+            data.as_ptr() as *const c_void,
+            root.as_ptr(),
+            &mut version_pointer,
+            &mut version_size,
+        ) == 0
+            || version_pointer.is_null()
+            || version_size < size_of::<VS_FIXEDFILEINFO>() as u32
+        {
+            return None;
+        }
+        let info = &*(version_pointer as *const VS_FIXEDFILEINFO);
+        if info.dwSignature != 0xFEEF04BD { return None; }
+        Some((
+            (info.dwFileVersionMS >> 16) as u16,
+            info.dwFileVersionMS as u16,
+            (info.dwFileVersionLS >> 16) as u16,
+            info.dwFileVersionLS as u16,
+        ))
+    }
+}
+
+fn running_version_is_newer(current: &Path, installed: &Path) -> bool {
+    matches!(
+        (executable_version(current), executable_version(installed)),
+        (Some(current), Some(installed)) if current > installed
+    )
+}
+
+fn installation_state() -> InstallationState {
+    let Some(installed) = installed_executable_path().filter(|path| path.is_file()) else {
+        return InstallationState::NotInstalled;
+    };
+    let Some(current) = std::env::current_exe().ok() else {
+        return InstallationState::InstalledOtherUpToDate;
+    };
+    if same_executable_path(&current, &installed) {
+        InstallationState::InstalledCurrent
+    } else if running_version_is_newer(&current, &installed) {
+        InstallationState::UpdateAvailable
+    } else {
+        InstallationState::InstalledOtherUpToDate
+    }
+}
+
+unsafe fn show_message(hwnd: HWND, title: &str, message: &str, flags: u32) -> i32 {
+    unsafe {
+        let title = wide(title);
+        let message = wide(message);
+        MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), flags | MB_RTLREADING | MB_RIGHT)
+    }
+}
+
+unsafe fn confirm_state(hwnd: HWND) -> Option<&'static mut ConfirmDialogState> {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ConfirmDialogState;
+    unsafe { pointer.as_mut() }
+}
+
+unsafe fn paint_confirm(hwnd: HWND) {
+    unsafe {
+        let Some(dialog) = confirm_state(hwnd) else { return; };
+        let mut ps: PAINTSTRUCT = zeroed();
+        let window_hdc = BeginPaint(hwnd, &mut ps);
+        if window_hdc.is_null() { return; }
+
+        let app = state().lock().unwrap();
+        let scale = app.scale();
+        let palette = Palette::from_theme(app.settings.theme);
+        let fonts = Fonts::create(scale);
+        let width = scaled(BASE_CONFIRM_WIDTH, scale);
+        let height = scaled(BASE_CONFIRM_HEIGHT, scale);
+        let hdc = CreateCompatibleDC(window_hdc);
+        let bitmap = CreateCompatibleBitmap(window_hdc, width, height);
+        if hdc.is_null() || bitmap.is_null() {
+            if !hdc.is_null() { DeleteDC(hdc); }
+            if !bitmap.is_null() { DeleteObject(bitmap as HGDIOBJ); }
+            drop(app);
+            fonts.destroy();
+            EndPaint(hwnd, &ps);
+            return;
+        }
+
+        let old_bitmap = SelectObject(hdc, bitmap as HGDIOBJ);
+        fill_rect_color(hdc, RECT { left: 0, top: 0, right: width, bottom: height }, palette.background);
+        draw_round_fill(hdc, RECT { left: 0, top: 0, right: width, bottom: height }, palette.surface, scaled(18, scale));
+        draw_text(
+            hdc,
+            &dialog.title,
+            scaled_rect(RECT { left: 28, top: 20, right: 402, bottom: 58 }, scale),
+            palette.accent,
+            fonts.title,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+        );
+        let message_bottom = if dialog.reminder.is_some() { 188 } else { 276 };
+        draw_text(
+            hdc,
+            &dialog.message,
+            scaled_rect(RECT { left: 28, top: 68, right: 402, bottom: message_bottom }, scale),
+            palette.text,
+            fonts.regular,
+            DT_RIGHT | DT_WORDBREAK | DT_RTLREADING,
+        );
+        if let Some(reminder) = dialog.reminder.as_deref() {
+            let reminder_rect = scaled_rect(RECT { left: 28, top: 198, right: 402, bottom: 276 }, scale);
+            draw_round_fill(hdc, reminder_rect, palette.selected, scaled(11, scale));
+            draw_round_outline(hdc, reminder_rect, palette.accent, scaled(11, scale), 1);
+            draw_text(
+                hdc,
+                reminder,
+                scaled_rect(RECT { left: 40, top: 204, right: 390, bottom: 270 }, scale),
+                palette.text,
+                fonts.small,
+                DT_RIGHT | DT_WORDBREAK | DT_RTLREADING,
+            );
+        }
+
+        let cancel_rect = scaled_rect(RECT { left: 26, top: 292, right: 204, bottom: 332 }, scale);
+        let accept_rect = scaled_rect(RECT { left: 226, top: 292, right: 404, bottom: 332 }, scale);
+        draw_round_fill(hdc, cancel_rect, palette.surface_alt, scaled(12, scale));
+        draw_round_outline(hdc, cancel_rect, palette.border, scaled(12, scale), 1);
+        draw_text(hdc, "انصراف", cancel_rect, palette.text, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        let accept_color = if dialog.destructive { palette.holiday } else { palette.accent };
+        let accept_text_color = if dialog.destructive { rgb(255, 255, 255) } else { palette.accent_text };
+        draw_round_fill(hdc, accept_rect, accept_color, scaled(12, scale));
+        draw_text(hdc, &dialog.accept_label, accept_rect, accept_text_color, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        draw_round_outline(
+            hdc,
+            RECT { left: 0, top: 0, right: width - 1, bottom: height - 1 },
+            palette.border,
+            scaled(18, scale),
+            1,
+        );
+
+        BitBlt(window_hdc, 0, 0, width, height, hdc, 0, 0, SRCCOPY);
+        SelectObject(hdc, old_bitmap);
+        DeleteObject(bitmap as HGDIOBJ);
+        DeleteDC(hdc);
+        drop(app);
+        fonts.destroy();
+        EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe extern "system" fn confirm_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_NCCREATE => {
+            let create = lparam as *const CREATESTRUCTW;
+            if create.is_null() { return 0; }
+            let pointer = unsafe { (*create).lpCreateParams } as *mut ConfirmDialogState;
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, pointer as isize); }
+            CONFIRM_HWND.store(hwnd as isize, Ordering::SeqCst);
+            1
+        }
+        WM_PAINT => { unsafe { paint_confirm(hwnd); } 0 }
+        WM_ERASEBKGND => 1,
+        WM_LBUTTONUP => {
+            let (x, y) = point_from_lparam(lparam);
+            let scale = state().lock().unwrap().scale();
+            let x = unscaled(x, scale);
+            let y = unscaled(y, scale);
+            if (226..=404).contains(&x) && (292..=332).contains(&y) {
+                if let Some(dialog) = unsafe { confirm_state(hwnd) } { dialog.accepted = true; }
+                unsafe { DestroyWindow(hwnd); }
+            } else if (26..=204).contains(&x) && (292..=332).contains(&y) {
+                unsafe { DestroyWindow(hwnd); }
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            match wparam as u32 {
+                0x0D => {
+                    if let Some(dialog) = unsafe { confirm_state(hwnd) } { dialog.accepted = true; }
+                    unsafe { DestroyWindow(hwnd); }
+                }
+                0x1B => unsafe { DestroyWindow(hwnd); },
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => { unsafe { DestroyWindow(hwnd); } 0 }
+        WM_NCDESTROY => {
+            CONFIRM_HWND.store(0, Ordering::SeqCst);
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+unsafe fn confirm_action(
+    owner: HWND,
+    title: &str,
+    message: &str,
+    reminder: Option<&str>,
+    accept_label: &str,
+    destructive: bool,
+) -> bool {
+    unsafe {
+        let instance = GetModuleHandleW(null());
+        let class_name = wide(CONFIRM_CLASS);
+        let window_title = wide(title);
+        let scale = state().lock().unwrap().scale();
+        let width = scaled(BASE_CONFIRM_WIDTH, scale);
+        let height = scaled(BASE_CONFIRM_HEIGHT, scale);
+        let mut owner_rect: RECT = zeroed();
+        GetWindowRect(owner, &mut owner_rect);
+        let x = owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2;
+        let y = owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2;
+        let mut dialog = ConfirmDialogState {
+            title: title.to_owned(),
+            message: message.to_owned(),
+            reminder: reminder.map(str::to_owned),
+            accept_label: accept_label.to_owned(),
+            destructive,
+            accepted: false,
+        };
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            class_name.as_ptr(),
+            window_title.as_ptr(),
+            WS_POPUP,
+            x,
+            y,
+            width,
+            height,
+            owner,
+            null_mut(),
+            instance,
+            &mut dialog as *mut ConfirmDialogState as *mut _,
+        );
+        if hwnd.is_null() { return false; }
+
+        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, scaled(18, scale), scaled(18, scale));
+        SetWindowRgn(hwnd, region, 1);
+        EnableWindow(owner, 0);
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        SetFocus(hwnd);
+
+        let mut message: MSG = zeroed();
+        while IsWindow(hwnd) != 0 {
+            let result = GetMessageW(&mut message, null_mut(), 0, 0);
+            if result <= 0 {
+                if result == 0 { PostQuitMessage(message.wParam as i32); }
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+
+        EnableWindow(owner, 1);
+        SetForegroundWindow(owner);
+        dialog.accepted
+    }
+}
+
+fn quoted_argument(path: &Path) -> String {
+    format!("\"{}\"", path.display())
+}
+
+unsafe fn launch_elevated_script(hwnd: HWND, script: &Path, arguments: &str) -> bool {
+    unsafe {
+        let operation = wide("runas");
+        let executable = wide("powershell.exe");
+        let parameters = wide(&format!(
+            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {} {}",
+            quoted_argument(script),
+            arguments,
+        ));
+        ShellExecuteW(
+            hwnd,
+            operation.as_ptr(),
+            executable.as_ptr(),
+            parameters.as_ptr(),
+            null(),
+            SW_SHOWNORMAL,
+        ) as isize > 32
+    }
+}
+
+fn install_script() -> &'static str {
+    r#"param([int]$TargetPid, [string]$Source, [string]$Destination)
+Wait-Process -Id $TargetPid -ErrorAction SilentlyContinue
+$folder = Split-Path -Parent $Destination
+$installed = $false
+for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    try {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $acl = Get-Acl -LiteralPath $folder
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.SetAccessRule($rule)
+        Set-Acl -LiteralPath $folder -AclObject $acl
+        $installed = $true
+        break
+    } catch {
+        Start-Sleep -Milliseconds 500
+    }
+}
+if ($installed) {
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $runValue = Get-ItemProperty -Path $runKey -Name 'GahYar' -ErrorAction SilentlyContinue
+    if ($null -ne $runValue) {
+        Set-ItemProperty -Path $runKey -Name 'GahYar' -Value ('"' + $Destination + '"')
+    }
+    Start-Process -FilePath $Destination
+} else {
+    Start-Process -FilePath $Source
+}
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+"#
+}
+
+fn uninstall_script() -> &'static str {
+    r#"param([int]$TargetPid, [string]$Destination, [int]$OpenGithub)
+Wait-Process -Id $TargetPid -ErrorAction SilentlyContinue
+$removed = $false
+for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    try {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+        $removed = -not (Test-Path -LiteralPath $Destination)
+        if ($removed) { break }
+    } catch {
+        Start-Sleep -Milliseconds 500
+    }
+}
+$folder = Split-Path -Parent $Destination
+if ($removed) {
+    Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'GahYar' -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $folder -Force -ErrorAction SilentlyContinue
+    if ($OpenGithub -eq 1) {
+        Start-Process 'https://github.com/emadgh/GahYar'
+    }
+} elseif (Test-Path -LiteralPath $Destination) {
+    Start-Process -FilePath $Destination
+}
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+"#
+}
+
+unsafe fn request_install(hwnd: HWND) -> bool {
+    unsafe {
+        let Some(destination) = installed_executable_path() else {
+            show_message(hwnd, "نصب گاه‌یار", "مسیر Program Files پیدا نشد.", MB_OK | MB_ICONERROR);
+            return false;
+        };
+        let Ok(source) = std::env::current_exe() else {
+            show_message(hwnd, "نصب گاه‌یار", "مسیر فایل اجرایی فعلی پیدا نشد.", MB_OK | MB_ICONERROR);
+            return false;
+        };
+        let installation = if destination.is_file() {
+            if same_executable_path(&source, &destination) {
+                InstallationState::InstalledCurrent
+            } else if running_version_is_newer(&source, &destination) {
+                InstallationState::UpdateAvailable
+            } else {
+                InstallationState::InstalledOtherUpToDate
+            }
+        } else {
+            InstallationState::NotInstalled
+        };
+        if matches!(installation, InstallationState::InstalledCurrent | InstallationState::InstalledOtherUpToDate) {
+            let message = if installation == InstallationState::InstalledCurrent {
+                "گاه‌یار هم‌اکنون در Program Files نصب شده است."
+            } else {
+                "نسخهٔ نصب‌شده با نسخهٔ فعلی یکسان یا از آن جدیدتر است و نیازی به بروزرسانی ندارد."
+            };
+            show_message(
+                hwnd,
+                "نصب گاه‌یار",
+                message,
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return false;
+        }
+        let updating = installation == InstallationState::UpdateAvailable;
+        let title = if updating { "بروزرسانی گاه‌یار" } else { "نصب گاه‌یار" };
+        let message = if updating {
+            "نسخه‌ای که اکنون اجرا کرده‌اید با نسخهٔ داخل Program Files متفاوت است.\n\nآیا فایل نصب‌شده با فایل فعلی جایگزین شود؟\n\nبرنامه بسته می‌شود و پس از بروزرسانی دوباره از مسیر نصب‌شده اجرا خواهد شد."
+        } else {
+            "آیا گاه‌یار در Program Files نصب شود؟\n\nبرنامه بسته می‌شود و پس از نصب دوباره اجرا خواهد شد.\n\nاگر مایل بودید، خوشحال می‌شویم گاه‌یار را به دوستانتان و در شبکه‌های اجتماعی پیشنهاد دهید."
+        };
+        if !confirm_action(
+            hwnd,
+            title,
+            message,
+            if updating { None } else { Some("یادآوری: گاه‌یار یک برنامهٔ پورتابل است و برای کارکردن نیازی به نصب در Program Files ندارد. انتقال آن به این پوشه فقط کمک می‌کند فایل برنامه اتفاقی حذف نشود و محل نگهداری مطمئن‌تری داشته باشد.") },
+            if updating { "بروزرسانی برنامه" } else { "نصب برنامه" },
+            false,
+        ) {
+            return false;
+        }
+        let script = std::env::temp_dir().join(format!("GahYar-install-{}.ps1", std::process::id()));
+        if fs::write(&script, install_script()).is_err() {
+            show_message(hwnd, "نصب گاه‌یار", "ساخت فایل موقت نصب ناموفق بود.", MB_OK | MB_ICONERROR);
+            return false;
+        }
+        let arguments = format!(
+            "-TargetPid {} -Source {} -Destination {}",
+            std::process::id(),
+            quoted_argument(&source),
+            quoted_argument(&destination),
+        );
+        if launch_elevated_script(hwnd, &script, &arguments) {
+            true
+        } else {
+            let _ = fs::remove_file(script);
+            show_message(hwnd, title, if updating { "بروزرسانی آغاز نشد یا اجازه دسترسی صادر نشد." } else { "نصب آغاز نشد یا اجازه دسترسی صادر نشد." }, MB_OK | MB_ICONWARNING);
+            false
+        }
+    }
+}
+
+unsafe fn request_uninstall(hwnd: HWND) -> bool {
+    unsafe {
+        let Some(destination) = installed_executable_path().filter(|path| path.is_file()) else {
+            show_message(
+                hwnd,
+                "حذف گاه‌یار",
+                "نسخه‌ای از گاه‌یار در Program Files نصب نشده است.",
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return false;
+        };
+        if !confirm_action(
+            hwnd,
+            "حذف گاه‌یار",
+            "آیا مطمئن هستید که می‌خواهید گاه‌یار را حذف کنید؟\n\nاز اینکه این مدت از گاه‌یار استفاده کردید خوشحالیم. اگر مایل بودید، همیشه می‌توانید برنامه را دوباره از GitHub دانلود کنید.\n\nخوشحال می‌شویم بازخوردتان را بشنویم.",
+            None,
+            "حذف برنامه",
+            true,
+        ) {
+            return false;
+        }
+        let open_github = confirm_action(
+            hwnd,
+            "بازخورد و دانلود مجدد",
+            "آیا پس از حذف، صفحه GitHub برای دانلود دوباره یا ارسال بازخورد باز شود؟",
+            None,
+            "باز کردن GitHub",
+            false,
+        );
+        let script = std::env::temp_dir().join(format!("GahYar-uninstall-{}.ps1", std::process::id()));
+        if fs::write(&script, uninstall_script()).is_err() {
+            show_message(hwnd, "حذف گاه‌یار", "ساخت فایل موقت حذف ناموفق بود.", MB_OK | MB_ICONERROR);
+            return false;
+        }
+        let arguments = format!(
+            "-TargetPid {} -Destination {} -OpenGithub {}",
+            std::process::id(),
+            quoted_argument(&destination),
+            if open_github { 1 } else { 0 },
+        );
+        if launch_elevated_script(hwnd, &script, &arguments) {
+            true
+        } else {
+            let _ = fs::remove_file(script);
+            show_message(hwnd, "حذف گاه‌یار", "حذف آغاز نشد یا اجازه دسترسی صادر نشد.", MB_OK | MB_ICONWARNING);
+            false
+        }
     }
 }
 
@@ -1263,220 +1866,6 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
         Shell_NotifyIconW(NIM_DELETE, &data);
         let custom = CUSTOM_TRAY_ICON.swap(0, Ordering::SeqCst) as HICON;
         if !custom.is_null() { DestroyIcon(custom); }
-    }
-}
-
-struct ClassWindowSearch {
-    target: *const u16,
-    found: HWND,
-}
-
-unsafe extern "system" fn find_class_window(hwnd: HWND, lparam: LPARAM) -> i32 {
-    unsafe {
-        let search = &mut *(lparam as *mut ClassWindowSearch);
-        let mut class_name = [0u16; 64];
-        if GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) > 0 {
-            let mut index = 0usize;
-            loop {
-                let left = class_name[index];
-                let right = *search.target.add(index);
-                if left != right { break; }
-                if left == 0 {
-                    search.found = hwnd;
-                    return 0;
-                }
-                index += 1;
-                if index >= class_name.len() { break; }
-            }
-        }
-        1
-    }
-}
-
-unsafe fn find_taskbar_descendant(taskbar: HWND, class_name: &str) -> HWND {
-    unsafe {
-        let target = wide(class_name);
-        let mut search = ClassWindowSearch { target: target.as_ptr(), found: null_mut() };
-        EnumChildWindows(taskbar, Some(find_class_window), &mut search as *mut ClassWindowSearch as LPARAM);
-        search.found
-    }
-}
-
-unsafe fn resize_taskbar_component(hwnd: HWND, desired_right: i32) -> bool {
-    unsafe {
-        if hwnd.is_null() { return false; }
-        let mut rect: RECT = zeroed();
-        if GetWindowRect(hwnd, &mut rect) == 0 { return false; }
-        let parent = GetParent(hwnd);
-        if parent.is_null() { return false; }
-        let mut origin = POINT { x: rect.left, y: rect.top };
-        if ScreenToClient(parent, &mut origin) == 0 { return false; }
-        let width = (desired_right - rect.left).max(1);
-        if (rect.right - desired_right).abs() <= 1 { return true; }
-        SetWindowPos(
-            hwnd,
-            null_mut(),
-            origin.x,
-            origin.y,
-            width,
-            rect.bottom - rect.top,
-            SWP_NOACTIVATE | SWP_NOZORDER,
-        ) != 0
-    }
-}
-
-unsafe fn set_taskbar_application_right_edge(taskbar: HWND, desired_right: i32) -> bool {
-    unsafe {
-        let task_list = find_taskbar_descendant(taskbar, "MSTaskListWClass");
-        let task_switch = find_taskbar_descendant(taskbar, "MSTaskSwWClass");
-        let list_changed = resize_taskbar_component(task_list, desired_right);
-        let switch_changed = resize_taskbar_component(task_switch, desired_right);
-        list_changed || switch_changed
-    }
-}
-
-unsafe fn restore_taskbar_layout() {
-    unsafe {
-        let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
-        if taskbar.is_null() { return; }
-        let tray = FindWindowExW(taskbar, null_mut(), wide("TrayNotifyWnd").as_ptr(), null());
-        let mut tray_rect: RECT = zeroed();
-        if !tray.is_null() && GetWindowRect(tray, &mut tray_rect) != 0 {
-            set_taskbar_application_right_edge(taskbar, tray_rect.left);
-        }
-    }
-}
-
-unsafe fn taskbar_widget_position() -> Option<(HWND, i32, i32, i32, i32)> {
-    unsafe {
-        let taskbar_class = wide("Shell_TrayWnd");
-        let taskbar = FindWindowW(taskbar_class.as_ptr(), null());
-        if taskbar.is_null() { return None; }
-        let mut taskbar_rect: RECT = zeroed();
-        if GetWindowRect(taskbar, &mut taskbar_rect) == 0 { return None; }
-        let horizontal = taskbar_rect.right - taskbar_rect.left >= taskbar_rect.bottom - taskbar_rect.top;
-        if horizontal {
-            let tray_class = wide("TrayNotifyWnd");
-            let tray = FindWindowExW(taskbar, null_mut(), tray_class.as_ptr(), null());
-            let mut tray_rect: RECT = zeroed();
-            let tray_left = if !tray.is_null() && GetWindowRect(tray, &mut tray_rect) != 0 {
-                tray_rect.left
-            } else {
-                taskbar_rect.right
-            };
-            let width = 126;
-            let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-            let height = taskbar_height.clamp(32, 48);
-            if !set_taskbar_application_right_edge(taskbar, tray_left - width) { return None; }
-            let x = tray_left - taskbar_rect.left - width;
-            let y = (taskbar_height - height) / 2;
-            Some((taskbar, x.max(0), y, width, height))
-        } else {
-            let width = (taskbar_rect.right - taskbar_rect.left - 8).clamp(32, 64);
-            Some((taskbar, 4, taskbar_rect.bottom - taskbar_rect.top - 50, width, 42))
-        }
-    }
-}
-
-unsafe fn update_taskbar_widget(owner: HWND) {
-    unsafe {
-        TASKBAR_WIDGET_OWNER.store(owner as isize, Ordering::SeqCst);
-        // Obsolete since 2.4.2. Always remove the old widget and restore taskbar space.
-        let enabled = false;
-        let mut widget = TASKBAR_WIDGET_HWND.load(Ordering::SeqCst) as HWND;
-        if !enabled {
-            restore_taskbar_layout();
-            if !widget.is_null() && IsWindow(widget) != 0 { DestroyWindow(widget); }
-            return;
-        }
-        let Some((taskbar, x, y, width, height)) = taskbar_widget_position() else { return; };
-        if widget.is_null() || IsWindow(widget) == 0 {
-            let instance = GetModuleHandleW(null());
-            let class_name = wide(TASKBAR_WIDGET_CLASS);
-            let title = wide(APP_NAME);
-            widget = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-                class_name.as_ptr(), title.as_ptr(), WS_CHILD | WS_VISIBLE,
-                x, y, width, height,
-                taskbar, null_mut(), instance, null(),
-            );
-            if widget.is_null() { return; }
-            SetLayeredWindowAttributes(widget, TASKBAR_WIDGET_TRANSPARENT_COLOR, 0, LWA_COLORKEY);
-            TASKBAR_WIDGET_HWND.store(widget as isize, Ordering::SeqCst);
-        } else if GetParent(widget) != taskbar {
-            SetParent(widget, taskbar);
-        }
-        SetWindowPos(widget, HWND_TOP, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        InvalidateRect(widget, null(), 0);
-    }
-}
-
-unsafe fn paint_taskbar_widget(hwnd: HWND) {
-    unsafe {
-        let mut ps: PAINTSTRUCT = zeroed();
-        let window_dc = BeginPaint(hwnd, &mut ps);
-        if window_dc.is_null() { return; }
-        let mut rect: RECT = zeroed();
-        GetClientRect(hwnd, &mut rect);
-        let dc = CreateCompatibleDC(window_dc);
-        let bitmap = CreateCompatibleBitmap(window_dc, rect.right, rect.bottom);
-        if dc.is_null() || bitmap.is_null() {
-            if !dc.is_null() { DeleteDC(dc); }
-            if !bitmap.is_null() { DeleteObject(bitmap as HGDIOBJ); }
-            EndPaint(hwnd, &ps);
-            return;
-        }
-        let old_bitmap = SelectObject(dc, bitmap as HGDIOBJ);
-        fill_rect_color(dc, rect, TASKBAR_WIDGET_TRANSPARENT_COLOR);
-        let app = state().lock().unwrap();
-        let today = from_gregorian(CalendarKind::Jalali, app.today_gregorian);
-        let text = format!("{}/{:02}/{:02}", persian_digits(today.year), today.month, today.day);
-        let mut window_rect: RECT = zeroed();
-        GetWindowRect(hwnd, &mut window_rect);
-        let screen_dc = GetDC(null_mut());
-        let sample = if screen_dc.is_null() {
-            GetSysColor(COLOR_3DFACE)
-        } else {
-            let color = GetPixel(screen_dc, window_rect.left + rect.right / 2, window_rect.top + rect.bottom / 2);
-            ReleaseDC(null_mut(), screen_dc);
-            color
-        };
-        let red = sample & 0xff;
-        let green = (sample >> 8) & 0xff;
-        let blue = (sample >> 16) & 0xff;
-        let luminance = red * 299 + green * 587 + blue * 114;
-        let text_color = if luminance > 145_000 { rgb(24, 24, 24) } else { rgb(245, 245, 245) };
-        let font = create_font(-14, FW_SEMIBOLD as i32, "Vazirmatn");
-        draw_text(dc, &persian_digits(text), RECT { left: 5, top: 0, right: rect.right - 5, bottom: rect.bottom }, text_color, font, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
-        DeleteObject(font as HGDIOBJ);
-        drop(app);
-        BitBlt(window_dc, 0, 0, rect.right, rect.bottom, dc, 0, 0, SRCCOPY);
-        SelectObject(dc, old_bitmap);
-        DeleteObject(bitmap as HGDIOBJ);
-        DeleteDC(dc);
-        EndPaint(hwnd, &ps);
-    }
-}
-
-unsafe extern "system" fn taskbar_widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match msg {
-        WM_PAINT => { unsafe { paint_taskbar_widget(hwnd); } 0 }
-        WM_ERASEBKGND => 1,
-        WM_LBUTTONUP => {
-            let owner = TASKBAR_WIDGET_OWNER.load(Ordering::SeqCst) as HWND;
-            if !owner.is_null() { unsafe { show_popup(owner); } }
-            0
-        }
-        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
-            let owner = TASKBAR_WIDGET_OWNER.load(Ordering::SeqCst) as HWND;
-            if !owner.is_null() { unsafe { update_taskbar_widget(owner); } }
-            0
-        }
-        WM_DESTROY => {
-            TASKBAR_WIDGET_HWND.store(0, Ordering::SeqCst);
-            0
-        }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
@@ -1589,7 +1978,6 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
         WM_CREATE => {
             unsafe {
                 add_tray_icon(hwnd);
-                update_taskbar_widget(hwnd);
                 SetTimer(hwnd, DATE_REFRESH_TIMER_ID, 60_000, None);
                 SetTimer(hwnd, UPDATE_CHECK_TIMER_ID, UPDATE_CHECK_INTERVAL_MS, None);
                 resize_main_window(hwnd, false);
@@ -1662,7 +2050,6 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
                 unsafe {
                     refresh_tray_tooltip(hwnd);
                     refresh_tray_icon(hwnd);
-                    update_taskbar_widget(hwnd);
                     InvalidateRect(hwnd, null(), 0);
                 }
             }
@@ -1729,6 +2116,7 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
             if (wparam as u32 & 0xffff) == WA_INACTIVE
                 && !EXITING.load(Ordering::SeqCst)
                 && ABOUT_HWND.load(Ordering::SeqCst) == 0
+                && CONFIRM_HWND.load(Ordering::SeqCst) == 0
             {
                 unsafe { ShowWindow(hwnd, SW_HIDE); }
             }
@@ -1749,19 +2137,13 @@ unsafe extern "system" fn main_window_proc(hwnd: HWND, msg: u32, wparam: WPARAM,
             0
         }
         _ if msg == taskbar_created_message() => {
-            unsafe {
-                add_tray_icon(hwnd);
-                update_taskbar_widget(hwnd);
-            }
+            unsafe { add_tray_icon(hwnd); }
             0
         }
         WM_DESTROY => {
             unsafe {
                 KillTimer(hwnd, DATE_REFRESH_TIMER_ID);
                 KillTimer(hwnd, UPDATE_CHECK_TIMER_ID);
-                restore_taskbar_layout();
-                let widget = TASKBAR_WIDGET_HWND.load(Ordering::SeqCst) as HWND;
-                if !widget.is_null() && IsWindow(widget) != 0 { DestroyWindow(widget); }
                 remove_tray_icon(hwnd);
                 PostQuitMessage(0);
             }
@@ -1819,8 +2201,8 @@ unsafe fn paint_about(hwnd: HWND) {
         fill_rect_color(hdc, RECT { left: 0, top: 0, right: width, bottom: height }, palette.surface);
         draw_round_fill(hdc, RECT { left: 0, top: 0, right: width, bottom: height }, palette.surface, scaled(18, scale));
         draw_text(hdc, "گاه‌یار،", scaled_rect(RECT { left: 50, top: 14, right: 330, bottom: 52 }, scale), palette.accent, fonts.title, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
-        draw_text(hdc, "نوشته شده توسط عماد قاسمی", scaled_rect(RECT { left: 34, top: 58, right: 346, bottom: 94 }, scale), palette.text, fonts.regular, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
-        draw_text(hdc, "emadghasemi.ir", scaled_rect(RECT { left: 34, top: 96, right: 346, bottom: 132 }, scale), palette.accent, fonts.medium, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        draw_text(hdc, "عماد قاسمی - emadghasemi.ir", scaled_rect(RECT { left: 34, top: 58, right: 346, bottom: 94 }, scale), palette.accent, fonts.regular, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
+        draw_text(hdc, "github.com/emadgh/GahYar", scaled_rect(RECT { left: 34, top: 96, right: 346, bottom: 132 }, scale), palette.event, fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         draw_text(hdc, &format!("نسخه {}", persian_digits(env!("CARGO_PKG_VERSION"))), scaled_rect(RECT { left: 34, top: 136, right: 346, bottom: 172 }, scale), palette.muted, fonts.small, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING);
         let update_text = match update::status() {
             update::UpdateStatus::Checking => "در حال بررسی…",
@@ -1849,8 +2231,10 @@ unsafe extern "system" fn about_window_proc(hwnd: HWND, msg: u32, _wparam: WPARA
             let scale = state().lock().unwrap().scale();
             let x = unscaled(x, scale);
             let y = unscaled(y, scale);
-            if (30..=350).contains(&x) && (96..=132).contains(&y) {
+            if (30..=350).contains(&x) && (54..=96).contains(&y) {
                 unsafe { open_website(hwnd); }
+            } else if (30..=350).contains(&x) && (96..=136).contains(&y) {
+                unsafe { open_github(hwnd); }
             } else if (60..=320).contains(&x) && (178..=232).contains(&y) {
                 let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
                 if !owner.is_null() { request_manual_update(owner); }
@@ -1874,7 +2258,7 @@ fn register_window_classes(instance: HINSTANCE) -> bool {
     unsafe {
         let main_class_name = wide(MAIN_CLASS);
         let about_class_name = wide(ABOUT_CLASS);
-        let widget_class_name = wide(TASKBAR_WIDGET_CLASS);
+        let confirm_class_name = wide(CONFIRM_CLASS);
         let main_class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW | CS_DBLCLKS,
             lpfnWndProc: Some(main_window_proc),
@@ -1899,21 +2283,21 @@ fn register_window_classes(instance: HINSTANCE) -> bool {
             lpszMenuName: null(),
             lpszClassName: about_class_name.as_ptr(),
         };
-        let widget_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-            lpfnWndProc: Some(taskbar_widget_proc),
+        let confirm_class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+            lpfnWndProc: Some(confirm_window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
             hIcon: load_app_icon(instance),
-            hCursor: LoadCursorW(null_mut(), IDC_HAND),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: null_mut(),
             lpszMenuName: null(),
-            lpszClassName: widget_class_name.as_ptr(),
+            lpszClassName: confirm_class_name.as_ptr(),
         };
         RegisterClassW(&main_class) != 0
             && RegisterClassW(&about_class) != 0
-            && RegisterClassW(&widget_class) != 0
+            && RegisterClassW(&confirm_class) != 0
     }
 }
 
@@ -1975,7 +2359,7 @@ fn main() {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::calendar_column;
+    use super::{calendar_column, executable_version};
 
     #[test]
     fn calendar_columns_follow_selected_direction() {
@@ -1986,5 +2370,16 @@ mod layout_tests {
         for column in 0..7 {
             assert_eq!(calendar_column(calendar_column(column, true), true), column);
         }
+    }
+
+    #[test]
+    fn executable_version_resource_is_readable() {
+        let executable = std::env::current_exe().expect("test executable path");
+        let version = executable_version(&executable).expect("embedded file version");
+        let expected = env!("CARGO_PKG_VERSION")
+            .split('.')
+            .map(|part| part.parse::<u16>().expect("numeric package version"))
+            .collect::<Vec<_>>();
+        assert_eq!(version, (expected[0], expected[1], expected[2], 0));
     }
 }
