@@ -47,7 +47,6 @@ pub struct Settings {
     pub show_tray_date: bool,
     pub auto_update: bool,
     pub tray_day_icon: bool,
-    pub taskbar_widget: bool,
     pub autostart: bool,
 }
 
@@ -55,7 +54,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: Theme::Dark,
-            ui_scale: 90,
+            ui_scale: 100,
             main_calendar: CalendarKind::Jalali,
             calendar_rtl: true,
             show_jalali: true,
@@ -66,7 +65,6 @@ impl Default for Settings {
             show_tray_date: true,
             auto_update: true,
             tray_day_icon: false,
-            taskbar_widget: false,
             autostart: false,
         }
     }
@@ -80,7 +78,7 @@ impl Settings {
                 let Some((key, value)) = line.split_once('=') else { continue; };
                 match key.trim() {
                     "theme" => settings.theme = Theme::from_key(value.trim()),
-                    "ui_scale" => settings.ui_scale = value.trim().parse::<u32>().unwrap_or(90).clamp(80, 125),
+                    "ui_scale" => settings.ui_scale = value.trim().parse::<u32>().unwrap_or(100).clamp(80, 125),
                     "main_calendar" => settings.main_calendar = CalendarKind::from_key(value.trim()),
                     "calendar_rtl" => settings.calendar_rtl = parse_bool(value),
                     "show_jalali" => settings.show_jalali = parse_bool(value),
@@ -91,8 +89,6 @@ impl Settings {
                     "show_tray_date" => settings.show_tray_date = parse_bool(value),
                     "auto_update" => settings.auto_update = parse_bool(value),
                     "tray_day_icon" => settings.tray_day_icon = parse_bool(value),
-                    // Obsolete since 2.4.2: retain the key only for settings-file compatibility.
-                    "taskbar_widget" => settings.taskbar_widget = false,
                     "autostart" => settings.autostart = parse_bool(value),
                     _ => {}
                 }
@@ -100,7 +96,6 @@ impl Settings {
         }
         // The registry is the source of truth, so stale settings cannot display a wrong state.
         settings.autostart = is_autostart_enabled();
-        settings.taskbar_widget = false;
         settings
     }
 
@@ -108,7 +103,7 @@ impl Settings {
         let path = settings_path();
         if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
         let text = format!(
-            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\ntaskbar_widget={}\nautostart={}\n",
+            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\nautostart={}\n",
             self.theme.key(),
             self.ui_scale,
             self.main_calendar.key(),
@@ -121,7 +116,6 @@ impl Settings {
             self.show_tray_date,
             self.auto_update,
             self.tray_day_icon,
-            self.taskbar_widget,
             self.autostart,
         );
         let _ = fs::write(path, text);
