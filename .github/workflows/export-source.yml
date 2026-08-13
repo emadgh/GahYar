@@ -1,0 +1,22 @@
+name: Export source snapshot
+
+on:
+  push:
+    branches: [agent/daily-view-build]
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare source snapshot
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force export | Out-Null
+          Copy-Item Cargo.toml,Cargo.lock,build.rs,app.rc,README.md export/
+          Copy-Item src,icon,fonts -Destination export -Recurse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GahYar-source-snapshot
+          path: export
