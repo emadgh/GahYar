@@ -1,7 +1,7 @@
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::os::windows::process::CommandExt;
 
 use crate::calendar::CalendarKind;
 
@@ -17,19 +17,32 @@ pub enum Theme {
 
 impl Theme {
     pub fn key(self) -> &'static str {
-        match self { Self::Dark => "dark", Self::Light => "light" }
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
     }
 
     pub fn from_key(value: &str) -> Self {
-        if value == "light" { Self::Light } else { Self::Dark }
+        if value == "light" {
+            Self::Light
+        } else {
+            Self::Dark
+        }
     }
 
     pub fn title(self) -> &'static str {
-        match self { Self::Dark => "تیره", Self::Light => "روشن" }
+        match self {
+            Self::Dark => "تیره",
+            Self::Light => "روشن",
+        }
     }
 
     pub fn toggle(self) -> Self {
-        match self { Self::Dark => Self::Light, Self::Light => Self::Dark }
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
     }
 }
 
@@ -47,6 +60,7 @@ pub struct Settings {
     pub show_tray_date: bool,
     pub auto_update: bool,
     pub tray_day_icon: bool,
+    pub compact_day: bool,
     pub autostart: bool,
 }
 
@@ -65,6 +79,7 @@ impl Default for Settings {
             show_tray_date: true,
             auto_update: true,
             tray_day_icon: false,
+            compact_day: false,
             autostart: false,
         }
     }
@@ -75,11 +90,18 @@ impl Settings {
         let mut settings = Self::default();
         if let Ok(text) = fs::read_to_string(settings_path()) {
             for line in text.lines() {
-                let Some((key, value)) = line.split_once('=') else { continue; };
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
                 match key.trim() {
                     "theme" => settings.theme = Theme::from_key(value.trim()),
-                    "ui_scale" => settings.ui_scale = value.trim().parse::<u32>().unwrap_or(100).clamp(80, 125),
-                    "main_calendar" => settings.main_calendar = CalendarKind::from_key(value.trim()),
+                    "ui_scale" => {
+                        settings.ui_scale =
+                            value.trim().parse::<u32>().unwrap_or(100).clamp(80, 125)
+                    }
+                    "main_calendar" => {
+                        settings.main_calendar = CalendarKind::from_key(value.trim())
+                    }
                     "calendar_rtl" => settings.calendar_rtl = parse_bool(value),
                     "show_jalali" => settings.show_jalali = parse_bool(value),
                     "show_gregorian" => settings.show_gregorian = parse_bool(value),
@@ -89,6 +111,7 @@ impl Settings {
                     "show_tray_date" => settings.show_tray_date = parse_bool(value),
                     "auto_update" => settings.auto_update = parse_bool(value),
                     "tray_day_icon" => settings.tray_day_icon = parse_bool(value),
+                    "compact_day" => settings.compact_day = parse_bool(value),
                     "autostart" => settings.autostart = parse_bool(value),
                     _ => {}
                 }
@@ -101,9 +124,11 @@ impl Settings {
 
     pub fn save(&self) {
         let path = settings_path();
-        if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let text = format!(
-            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\nautostart={}\n",
+            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\ncompact_day={}\nautostart={}\n",
             self.theme.key(),
             self.ui_scale,
             self.main_calendar.key(),
@@ -116,6 +141,7 @@ impl Settings {
             self.show_tray_date,
             self.auto_update,
             self.tray_day_icon,
+            self.compact_day,
             self.autostart,
         );
         let _ = fs::write(path, text);
@@ -150,7 +176,9 @@ pub fn set_autostart(enabled: bool) -> bool {
     let mut command = Command::new("reg.exe");
     command.creation_flags(CREATE_NO_WINDOW);
     if enabled {
-        let Ok(executable) = std::env::current_exe() else { return false; };
+        let Ok(executable) = std::env::current_exe() else {
+            return false;
+        };
         let value = format!("\"{}\"", executable.display());
         command.args([
             "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &value, "/f",
@@ -159,7 +187,10 @@ pub fn set_autostart(enabled: bool) -> bool {
         command.args(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]);
     }
 
-    command.status().map(|status| status.success()).unwrap_or(false)
+    command
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn is_autostart_enabled() -> bool {
@@ -176,6 +207,8 @@ fn parse_bool(value: &str) -> bool {
 }
 
 fn settings_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     base.join("GahYar").join("settings.ini")
 }

@@ -35,21 +35,31 @@ fn main() {
 fn find_resource_compiler(arch: &str) -> Option<PathBuf> {
     if let Some(sdk_dir) = env::var_os("WindowsSdkDir") {
         let bin = PathBuf::from(sdk_dir).join("bin");
-        if let Some(found) = newest_rc(&bin, arch) { return Some(found); }
+        if let Some(found) = newest_rc(&bin, arch) {
+            return Some(found);
+        }
     }
-    newest_rc(Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin"), arch)
+    newest_rc(
+        Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin"),
+        arch,
+    )
 }
 
 fn newest_rc(bin: &Path, arch: &str) -> Option<PathBuf> {
     let direct = bin.join(arch).join("rc.exe");
-    if direct.is_file() { return Some(direct); }
-    let mut versions = fs::read_dir(bin).ok()?
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let mut versions = fs::read_dir(bin)
+        .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
     versions.sort();
-    versions.into_iter().rev()
+    versions
+        .into_iter()
+        .rev()
         .map(|version| version.join(arch).join("rc.exe"))
         .find(|path| path.is_file())
 }

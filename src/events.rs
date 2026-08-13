@@ -67,20 +67,28 @@ impl EventStore {
     pub fn load() -> Self {
         let embedded = include_str!("../assets/iran-calendar-events-1405.json");
         let (json, label) = external_json()
-            .and_then(|path| fs::read_to_string(&path).ok().map(|content| (content, format!("فایل محلی: {}", path.display()))))
+            .and_then(|path| {
+                fs::read_to_string(&path)
+                    .ok()
+                    .map(|content| (content, format!("فایل محلی: {}", path.display())))
+            })
             .unwrap_or_else(|| (embedded.to_owned(), "دادهٔ داخلی سال ۱۴۰۵".to_string()));
 
         match serde_json::from_str::<RawDatabase>(&json) {
             Ok(raw) => {
-                let events = raw.events.into_iter().map(|event| CalendarEvent {
-                    jalali_year: event.jalali.year,
-                    jalali_month: event.jalali.month,
-                    jalali_day: event.jalali.day,
-                    title: event.title,
-                    description: event.description,
-                    category: event.category,
-                    official_holiday: event.is_official_holiday,
-                }).collect::<Vec<_>>();
+                let events = raw
+                    .events
+                    .into_iter()
+                    .map(|event| CalendarEvent {
+                        jalali_year: event.jalali.year,
+                        jalali_month: event.jalali.month,
+                        jalali_day: event.jalali.day,
+                        title: event.title,
+                        description: event.description,
+                        category: event.category,
+                        official_holiday: event.is_official_holiday,
+                    })
+                    .collect::<Vec<_>>();
                 let count = if raw.metadata.statistics.event_count > 0 {
                     raw.metadata.statistics.event_count
                 } else {
@@ -105,17 +113,24 @@ impl EventStore {
     }
 
     pub fn events_for_day(&self, year: i32, month: u32, day: u32) -> Vec<&CalendarEvent> {
-        self.events.iter().filter(|event| {
-            event.jalali_year == year && event.jalali_month == month && event.jalali_day == day
-        }).collect()
+        self.events
+            .iter()
+            .filter(|event| {
+                event.jalali_year == year && event.jalali_month == month && event.jalali_day == day
+            })
+            .collect()
     }
 
     pub fn events_for_month(&self, year: i32, month: u32) -> Vec<&CalendarEvent> {
-        self.events.iter().filter(|event| event.jalali_year == year && event.jalali_month == month).collect()
+        self.events
+            .iter()
+            .filter(|event| event.jalali_year == year && event.jalali_month == month)
+            .collect()
     }
 
     pub fn is_official_holiday(&self, year: i32, month: u32, day: u32) -> bool {
-        self.holiday_dates.contains(&format!("{year:04}-{month:02}-{day:02}"))
+        self.holiday_dates
+            .contains(&format!("{year:04}-{month:02}-{day:02}"))
     }
 }
 
