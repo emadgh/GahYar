@@ -44,6 +44,7 @@ const WEBSITE_URL: &str = "https://emadghasemi.ir";
 const GITHUB_URL: &str = "https://github.com/emadgh/GahYar";
 const APP_ICON_ID: usize = 1;
 const MAIN_CLASS: &str = "GahYarMain";
+const SETTINGS_CLASS: &str = "GahYarSettings";
 const ABOUT_CLASS: &str = "GahYarAbout";
 const CONFIRM_CLASS: &str = "GahYarConfirm";
 const BASE_WIDTH: i32 = 430;
@@ -52,7 +53,6 @@ const BASE_EVENTS_HEIGHT: i32 = 136;
 const BASE_FOOTER_HEIGHT: i32 = 30;
 const BASE_UPDATE_HEIGHT: i32 = 42;
 const BASE_SETTINGS_HEIGHT: i32 = 834;
-const BASE_HEIGHT_COMPACT: i32 = 126;
 const BASE_ABOUT_WIDTH: i32 = 380;
 const BASE_ABOUT_HEIGHT: i32 = 300;
 const BASE_CONFIRM_WIDTH: i32 = 430;
@@ -91,6 +91,7 @@ static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 static EXITING: AtomicBool = AtomicBool::new(false);
 static MANUAL_UPDATE_REQUEST: AtomicBool = AtomicBool::new(false);
 static ABOUT_HWND: AtomicIsize = AtomicIsize::new(0);
+static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 static CONFIRM_HWND: AtomicIsize = AtomicIsize::new(0);
 static CUSTOM_TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
 static FONT_RESOURCE_HANDLE: AtomicIsize = AtomicIsize::new(0);
@@ -152,7 +153,7 @@ impl AppState {
             BASE_SETTINGS_HEIGHT + BASE_FOOTER_HEIGHT
         } else {
             (if self.settings.compact_day {
-                BASE_HEIGHT_COMPACT
+                compact_header_height(self)
             } else {
                 BASE_HEIGHT_CALENDAR
             }) + if self.settings.show_events {
@@ -482,6 +483,30 @@ fn secondary_ranges(app: &AppState) -> Vec<String> {
     if !app.settings.show_subtitles {
         return Vec::new();
     }
+    if app.settings.compact_day {
+        let today = app.today_main();
+        let day = app.selected_day.unwrap_or_else(|| {
+            if app.year == today.year && app.month == today.month {
+                today.day
+            } else {
+                1
+            }
+        });
+        let primary = Date::new(app.year, app.month, day);
+        return secondary_dates(app, primary)
+            .into_iter()
+            .map(|(kind, date)| {
+                let (day, year) = match kind {
+                    CalendarKind::Gregorian => (date.day.to_string(), date.year.to_string()),
+                    CalendarKind::Jalali | CalendarKind::Hijri => {
+                        (persian_digits(date.day), persian_digits(date.year))
+                    }
+                };
+                format!("{} {} {}", day, month_name(kind, date.month), year)
+            })
+            .take(2)
+            .collect();
+    }
     let mut values = Vec::new();
     let main = app.settings.main_calendar;
     if main != CalendarKind::Gregorian && app.settings.show_gregorian {
@@ -579,10 +604,33 @@ fn event_items_for_view<'a>(app: &'a AppState) -> Vec<(u32, &'a CalendarEvent)> 
 
 fn events_top(app: &AppState) -> i32 {
     if app.settings.compact_day {
-        COMPACT_EVENTS_TOP
+        compact_header_height(app)
     } else {
         EVENTS_TOP
     }
+}
+
+fn today_is_active(app: &AppState) -> bool {
+    let today = app.today_main();
+    app.year == today.year && app.month == today.month && app.selected_day == Some(today.day)
+}
+
+fn compact_header_height(app: &AppState) -> i32 {
+    if today_is_active(app) {
+        COMPACT_EVENTS_TOP
+    } else {
+        COMPACT_EVENTS_TOP + 8
+    }
+}
+
+fn settings_window_height(app: &AppState) -> i32 {
+    BASE_SETTINGS_HEIGHT
+        + BASE_FOOTER_HEIGHT
+        + if !app.settings.auto_update && update::banner_visible() {
+            BASE_UPDATE_HEIGHT
+        } else {
+            0
+        }
 }
 
 fn move_calendar_day(app: &mut AppState, delta: i32) {
@@ -656,11 +704,81 @@ unsafe fn paint_main(hwnd: HWND) {
             scaled(18, scale),
         );
 
-        match app.view {
-            ViewMode::Calendar => paint_calendar(hdc, &app, &palette, &fonts),
-            ViewMode::Settings => paint_settings(hdc, &app, &palette, &fonts),
+        paint_calendar(hdc, &app, &palette, &fonts);
+
+        draw_round_outline(
+            hdc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: width - 1,
+                bottom: height - 1,
+            },
+            palette.border,
+            scaled(18, scale),
+            1,
+        );
+        BitBlt(window_hdc, 0, 0, width, height, hdc, 0, 0, SRCCOPY);
+        SelectObject(hdc, old_bitmap);
+        DeleteObject(bitmap as HGDIOBJ);
+        DeleteDC(hdc);
+        drop(app);
+        fonts.destroy();
+        EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe fn paint_settings_window(hwnd: HWND) {
+    unsafe {
+        let mut ps: PAINTSTRUCT = zeroed();
+        let window_hdc = BeginPaint(hwnd, &mut ps);
+        if window_hdc.is_null() {
+            return;
         }
 
+        let app = state().lock().unwrap();
+        let scale = app.scale();
+        let palette = Palette::from_theme(app.settings.theme);
+        let fonts = Fonts::create(scale);
+        let width = scaled(BASE_WIDTH, scale);
+        let height = scaled(settings_window_height(&app), scale);
+        let hdc = CreateCompatibleDC(window_hdc);
+        let bitmap = CreateCompatibleBitmap(window_hdc, width, height);
+        if hdc.is_null() || bitmap.is_null() {
+            if !hdc.is_null() {
+                DeleteDC(hdc);
+            }
+            if !bitmap.is_null() {
+                DeleteObject(bitmap as HGDIOBJ);
+            }
+            drop(app);
+            fonts.destroy();
+            EndPaint(hwnd, &ps);
+            return;
+        }
+        let old_bitmap = SelectObject(hdc, bitmap as HGDIOBJ);
+        fill_rect_color(
+            hdc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            },
+            palette.background,
+        );
+        draw_round_fill(
+            hdc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            },
+            palette.surface,
+            scaled(18, scale),
+        );
+        paint_settings(hdc, &app, &palette, &fonts);
         draw_round_outline(
             hdc,
             RECT {
@@ -738,62 +856,63 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
 
+        let compact = app.settings.compact_day;
+        let today_active = today_is_active(app);
+        let header_shift = if today_active { 14 } else { 0 };
+
         draw_text(
             hdc,
             &main_date_heading(app),
             sr(RECT {
                 left: 72,
-                top: 7,
+                top: 7 + header_shift,
                 right: 358,
-                bottom: 43,
+                bottom: 43 + header_shift,
             }),
             palette.accent,
             fonts.medium,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
 
-        let compact = app.settings.compact_day;
-        if !compact {
-            let ranges = secondary_ranges(app);
-            if let Some(first) = ranges.first() {
-                draw_text(
-                    hdc,
-                    first,
-                    sr(RECT {
-                        left: 58,
-                        top: 44,
-                        right: 372,
-                        bottom: 62,
-                    }),
-                    palette.text,
-                    fonts.small,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-                );
-            }
-            if let Some(second) = ranges.get(1) {
-                draw_text(
-                    hdc,
-                    second,
-                    sr(RECT {
-                        left: 58,
-                        top: 62,
-                        right: 372,
-                        bottom: 80,
-                    }),
-                    palette.muted,
-                    fonts.small,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-                );
-            }
+        let ranges = secondary_ranges(app);
+        if let Some(first) = ranges.first() {
+            draw_text(
+                hdc,
+                first,
+                sr(RECT {
+                    left: 58,
+                    top: 44 + header_shift,
+                    right: 372,
+                    bottom: 62 + header_shift,
+                }),
+                palette.text,
+                fonts.small,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+            );
+        }
+        if let Some(second) = ranges.get(1) {
+            draw_text(
+                hdc,
+                second,
+                sr(RECT {
+                    left: 58,
+                    top: 62 + header_shift,
+                    right: 372,
+                    bottom: 80 + header_shift,
+                }),
+                palette.muted,
+                fonts.small,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+            );
         }
 
         draw_round_fill(
             hdc,
             sr(RECT {
                 left: 16,
-                top: 57,
+                top: 57 + header_shift,
                 right: 50,
-                bottom: 89,
+                bottom: 89 + header_shift,
             }),
             palette.surface_alt,
             scaled(11, scale),
@@ -803,9 +922,9 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             "ⓘ",
             sr(RECT {
                 left: 16,
-                top: 56,
+                top: 56 + header_shift,
                 right: 50,
-                bottom: 88,
+                bottom: 88 + header_shift,
             }),
             palette.muted,
             fonts.icon,
@@ -815,9 +934,9 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             hdc,
             sr(RECT {
                 left: 380,
-                top: 57,
+                top: 57 + header_shift,
                 right: 414,
-                bottom: 89,
+                bottom: 89 + header_shift,
             }),
             palette.surface_alt,
             scaled(11, scale),
@@ -827,45 +946,39 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             "⚙",
             sr(RECT {
                 left: 380,
-                top: 55,
+                top: 55 + header_shift,
                 right: 414,
-                bottom: 89,
+                bottom: 89 + header_shift,
             }),
             palette.muted,
             fonts.icon,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
-        if !compact {
-            let today = app.today_main();
-            let today_is_active = app.year == today.year
-                && app.month == today.month
-                && app.selected_day == Some(today.day);
-            if !today_is_active {
-                draw_round_fill(
-                    hdc,
-                    sr(RECT {
-                        left: 174,
-                        top: 83,
-                        right: 256,
-                        bottom: 108,
-                    }),
-                    palette.accent,
-                    scaled(12, scale),
-                );
-                draw_text(
-                    hdc,
-                    "برو به امروز",
-                    sr(RECT {
-                        left: 174,
-                        top: 83,
-                        right: 256,
-                        bottom: 108,
-                    }),
-                    palette.accent_text,
-                    fonts.tiny,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-                );
-            }
+        if !today_active {
+            draw_round_fill(
+                hdc,
+                sr(RECT {
+                    left: 174,
+                    top: 83,
+                    right: 256,
+                    bottom: 108,
+                }),
+                palette.accent,
+                scaled(12, scale),
+            );
+            draw_text(
+                hdc,
+                "برو به امروز",
+                sr(RECT {
+                    left: 174,
+                    top: 83,
+                    right: 256,
+                    bottom: 108,
+                }),
+                palette.accent_text,
+                fonts.tiny,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+            );
         }
 
         if !compact {
@@ -1053,7 +1166,13 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         if app.settings.show_events {
             paint_events(hdc, app, palette, fonts);
         }
-        paint_footer(hdc, app, palette, fonts);
+        paint_footer(
+            hdc,
+            app,
+            palette,
+            fonts,
+            app.base_height() - BASE_FOOTER_HEIGHT,
+        );
     }
 }
 
@@ -1323,10 +1442,9 @@ unsafe fn paint_events(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Font
     }
 }
 
-unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts) {
+unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts, top: i32) {
     unsafe {
         let scale = app.scale();
-        let top = app.base_height() - BASE_FOOTER_HEIGHT;
         paint_update_banner(hdc, app, palette, fonts, top);
         draw_text(
             hdc,
@@ -1523,6 +1641,15 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             palette,
             fonts,
             218,
+            "تقویم کوچک (روز بدون تقویم)",
+            app.settings.compact_day,
+        );
+        paint_toggle_row(
+            hdc,
+            app,
+            palette,
+            fonts,
+            262,
             "چیدمان تقویم از راست به چپ",
             app.settings.calendar_rtl,
         );
@@ -1531,7 +1658,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            262,
+            306,
             "نمایش تاریخ شمسی",
             app.settings.show_jalali,
         );
@@ -1540,7 +1667,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            306,
+            350,
             "نمایش تاریخ میلادی",
             app.settings.show_gregorian,
         );
@@ -1549,7 +1676,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            350,
+            394,
             "نمایش تاریخ قمری",
             app.settings.show_hijri,
         );
@@ -1558,7 +1685,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            394,
+            438,
             "نمایش عنوان تقویم‌های جانبی",
             app.settings.show_subtitles,
         );
@@ -1567,7 +1694,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            438,
+            482,
             "نمایش بخش مناسبت‌ها",
             app.settings.show_events,
         );
@@ -1576,7 +1703,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            482,
+            526,
             "نمایش تاریخ کامل در Tooltip",
             app.settings.show_tray_date,
         );
@@ -1585,7 +1712,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            526,
+            570,
             "بروزرسانی خودکار",
             app.settings.auto_update,
         );
@@ -1594,18 +1721,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            570,
+            614,
             "نمایش شماره روز روی آیکن Tray",
             app.settings.tray_day_icon,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            614,
-            "نمایش روزانه (بدون تقویم)",
-            app.settings.compact_day,
         );
         paint_toggle_row(
             hdc,
@@ -1719,7 +1837,13 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             fonts.medium,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
-        paint_footer(hdc, app, palette, fonts);
+        paint_footer(
+            hdc,
+            app,
+            palette,
+            fonts,
+            settings_window_height(app) - BASE_FOOTER_HEIGHT,
+        );
     }
 }
 
@@ -1997,8 +2121,10 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
-unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
+unsafe fn handle_window_click(hwnd: HWND, source_hwnd: HWND, settings_click: bool, x: i32, y: i32) {
     let mut show_about_dialog = false;
+    let mut show_settings_panel = false;
+    let mut close_settings_panel = false;
     let mut open_website_link = false;
     let mut open_github_link = false;
     let mut refresh_tooltip = false;
@@ -2013,7 +2139,11 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
         let mut app = state().lock().unwrap();
         let x = unscaled(x, app.scale());
         let y = unscaled(y, app.scale());
-        let footer_top = app.base_height() - BASE_FOOTER_HEIGHT;
+        let footer_top = if settings_click {
+            settings_window_height(&app) - BASE_FOOTER_HEIGHT
+        } else {
+            app.base_height() - BASE_FOOTER_HEIGHT
+        };
         if y >= footer_top {
             if x >= 178 {
                 open_website_link = true;
@@ -2030,8 +2160,13 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                 _ => {}
             }
         } else {
-            match app.view {
+            match if settings_click {
+                ViewMode::Settings
+            } else {
+                ViewMode::Calendar
+            } {
                 ViewMode::Calendar => {
+                    let header_shift = if today_is_active(&app) { 14 } else { 0 };
                     if y >= 8 && y <= 48 && x <= 75 {
                         if app.settings.compact_day {
                             move_calendar_day(&mut app, -1);
@@ -2066,20 +2201,13 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                             app.selected_day = None;
                             app.event_scroll = 0;
                         }
-                    } else if (54..=94).contains(&y) && x <= 62 {
+                    } else if (54 + header_shift..=94 + header_shift).contains(&y) && x <= 62 {
                         show_about_dialog = true;
-                    } else if (54..=94).contains(&y) && x >= 368 {
-                        app.view = ViewMode::Settings;
-                        resize = true;
-                    } else if !app.settings.compact_day
-                        && (78..=113).contains(&y)
-                        && (160..=270).contains(&x)
-                    {
-                        let today = app.today_main();
-                        let today_is_active = app.year == today.year
-                            && app.month == today.month
-                            && app.selected_day == Some(today.day);
-                        if !today_is_active {
+                    } else if (54 + header_shift..=94 + header_shift).contains(&y) && x >= 368 {
+                        show_settings_panel = true;
+                    } else if (78..=113).contains(&y) && (160..=270).contains(&x) {
+                        if !today_is_active(&app) {
+                            let today = app.today_main();
                             app.year = today.year;
                             app.month = today.month;
                             app.selected_day = Some(today.day);
@@ -2125,8 +2253,7 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                 }
                 ViewMode::Settings => {
                     if y <= 54 && x >= 350 {
-                        app.view = ViewMode::Calendar;
-                        resize = true;
+                        close_settings_panel = true;
                     } else if (76..=120).contains(&y) {
                         app.settings.theme = app.settings.theme.toggle();
                         app.settings.save();
@@ -2143,38 +2270,6 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                         app.set_main_calendar(next);
                         app.settings.save();
                     } else if (216..=258).contains(&y) {
-                        app.settings.calendar_rtl = !app.settings.calendar_rtl;
-                        app.settings.save();
-                    } else if (260..=302).contains(&y) {
-                        app.settings.show_jalali = !app.settings.show_jalali;
-                        app.settings.save();
-                    } else if (304..=346).contains(&y) {
-                        app.settings.show_gregorian = !app.settings.show_gregorian;
-                        app.settings.save();
-                    } else if (348..=390).contains(&y) {
-                        app.settings.show_hijri = !app.settings.show_hijri;
-                        app.settings.save();
-                    } else if (392..=434).contains(&y) {
-                        app.settings.show_subtitles = !app.settings.show_subtitles;
-                        app.settings.save();
-                    } else if (436..=478).contains(&y) {
-                        app.settings.show_events = !app.settings.show_events;
-                        app.settings.save();
-                        resize = true;
-                    } else if (480..=522).contains(&y) {
-                        app.settings.show_tray_date = !app.settings.show_tray_date;
-                        app.settings.save();
-                        refresh_tooltip = true;
-                    } else if (524..=568).contains(&y) {
-                        app.settings.auto_update = !app.settings.auto_update;
-                        enable_auto_update = app.settings.auto_update;
-                        app.settings.save();
-                        resize = true;
-                    } else if (569..=612).contains(&y) {
-                        app.settings.tray_day_icon = !app.settings.tray_day_icon;
-                        app.settings.save();
-                        refresh_tray_visual = true;
-                    } else if (613..=656).contains(&y) {
                         app.settings.compact_day = !app.settings.compact_day;
                         if app.settings.compact_day && app.selected_day.is_none() {
                             let today = app.today_main();
@@ -2188,6 +2283,38 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                         app.event_scroll = 0;
                         app.settings.save();
                         resize = true;
+                    } else if (260..=302).contains(&y) {
+                        app.settings.calendar_rtl = !app.settings.calendar_rtl;
+                        app.settings.save();
+                    } else if (304..=346).contains(&y) {
+                        app.settings.show_jalali = !app.settings.show_jalali;
+                        app.settings.save();
+                    } else if (348..=390).contains(&y) {
+                        app.settings.show_gregorian = !app.settings.show_gregorian;
+                        app.settings.save();
+                    } else if (392..=434).contains(&y) {
+                        app.settings.show_hijri = !app.settings.show_hijri;
+                        app.settings.save();
+                    } else if (436..=478).contains(&y) {
+                        app.settings.show_subtitles = !app.settings.show_subtitles;
+                        app.settings.save();
+                    } else if (480..=522).contains(&y) {
+                        app.settings.show_events = !app.settings.show_events;
+                        app.settings.save();
+                        resize = true;
+                    } else if (524..=568).contains(&y) {
+                        app.settings.show_tray_date = !app.settings.show_tray_date;
+                        app.settings.save();
+                        refresh_tooltip = true;
+                    } else if (569..=612).contains(&y) {
+                        app.settings.auto_update = !app.settings.auto_update;
+                        enable_auto_update = app.settings.auto_update;
+                        app.settings.save();
+                        resize = true;
+                    } else if (613..=656).contains(&y) {
+                        app.settings.tray_day_icon = !app.settings.tray_day_icon;
+                        app.settings.save();
+                        refresh_tray_visual = true;
                     } else if (657..=704).contains(&y) {
                         let next = !app.settings.autostart;
                         if set_autostart(next) {
@@ -2229,10 +2356,28 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
     if resize {
         unsafe {
             resize_main_window(hwnd, true);
+            let settings = SETTINGS_HWND.load(Ordering::SeqCst) as HWND;
+            if !settings.is_null() && IsWindow(settings) != 0 {
+                position_settings_window(hwnd, settings, false);
+            }
         }
     }
     unsafe {
         InvalidateRect(hwnd, null(), 0);
+        let settings = SETTINGS_HWND.load(Ordering::SeqCst) as HWND;
+        if !settings.is_null() && IsWindow(settings) != 0 {
+            InvalidateRect(settings, null(), 0);
+        }
+    }
+    if show_settings_panel {
+        unsafe {
+            show_settings(hwnd);
+        }
+    }
+    if close_settings_panel {
+        unsafe {
+            DestroyWindow(source_hwnd);
+        }
     }
     if show_about_dialog {
         unsafe {
@@ -2259,14 +2404,14 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
             refresh_tray_icon(hwnd);
         }
     }
-    if install_requested && unsafe { request_install(hwnd) } {
+    if install_requested && unsafe { request_install(source_hwnd) } {
         EXITING.store(true, Ordering::SeqCst);
         unsafe {
             DestroyWindow(hwnd);
         }
         return;
     }
-    if uninstall_requested && unsafe { request_uninstall(hwnd) } {
+    if uninstall_requested && unsafe { request_uninstall(source_hwnd) } {
         EXITING.store(true, Ordering::SeqCst);
         unsafe {
             DestroyWindow(hwnd);
@@ -3349,6 +3494,103 @@ unsafe fn resize_main_window(hwnd: HWND, preserve_bottom: bool) {
     }
 }
 
+unsafe fn position_settings_window(main_hwnd: HWND, settings_hwnd: HWND, show: bool) {
+    unsafe {
+        let app = state().lock().unwrap();
+        let scale = app.scale();
+        let width = scaled(BASE_WIDTH, scale);
+        let height = scaled(settings_window_height(&app), scale);
+        let main_width = scaled(BASE_WIDTH, scale);
+        let radius = scaled(18, scale);
+        let gap = scaled(8, scale);
+        drop(app);
+
+        let mut main_rect: RECT = zeroed();
+        GetWindowRect(main_hwnd, &mut main_rect);
+        let monitor = MonitorFromRect(&main_rect, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(monitor, &mut info);
+        let work = info.rcWork;
+
+        let minimum_left = work.left + 8;
+        let maximum_main_left = work.right - main_width - 8;
+        let mut main_left = main_rect.left;
+        let mut x = main_left - width - gap;
+        if x < minimum_left {
+            main_left = (minimum_left + width + gap).min(maximum_main_left);
+            SetWindowPos(
+                main_hwnd,
+                HWND_TOPMOST,
+                main_left,
+                main_rect.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            x = main_left - width - gap;
+        }
+        let desired_y = main_rect.bottom - height;
+        let y = desired_y
+            .max(work.top + 8)
+            .min((work.bottom - height - 8).max(work.top + 8));
+        SetWindowPos(
+            settings_hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            if show { SWP_SHOWWINDOW } else { SWP_NOACTIVATE },
+        );
+        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
+        SetWindowRgn(settings_hwnd, region, 1);
+    }
+}
+
+unsafe fn show_settings(main_hwnd: HWND) {
+    unsafe {
+        if IsWindowVisible(main_hwnd) == 0 {
+            show_popup(main_hwnd);
+        }
+        let existing = SETTINGS_HWND.load(Ordering::SeqCst) as HWND;
+        if !existing.is_null() && IsWindow(existing) != 0 {
+            position_settings_window(main_hwnd, existing, true);
+            SetForegroundWindow(existing);
+            InvalidateRect(existing, null(), 0);
+            return;
+        }
+
+        let instance = GetModuleHandleW(null());
+        let class_name = wide(SETTINGS_CLASS);
+        let title = wide("تنظیمات گاه‌یار");
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            0,
+            0,
+            main_hwnd,
+            null_mut(),
+            instance,
+            null(),
+        );
+        if hwnd.is_null() {
+            return;
+        }
+        SETTINGS_HWND.store(hwnd as isize, Ordering::SeqCst);
+        position_settings_window(main_hwnd, hwnd, true);
+        ShowWindow(main_hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        InvalidateRect(main_hwnd, null(), 0);
+        InvalidateRect(hwnd, null(), 0);
+    }
+}
+
 unsafe fn show_popup(hwnd: HWND) {
     unsafe {
         let app = state().lock().unwrap();
@@ -3373,11 +3615,23 @@ unsafe fn show_popup(hwnd: HWND) {
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
         InvalidateRect(hwnd, null(), 0);
+        let settings = SETTINGS_HWND.load(Ordering::SeqCst) as HWND;
+        if !settings.is_null() && IsWindow(settings) != 0 {
+            position_settings_window(hwnd, settings, true);
+            SetForegroundWindow(settings);
+        }
     }
 }
 
 unsafe fn toggle_popup(hwnd: HWND) {
     unsafe {
+        let settings = SETTINGS_HWND.load(Ordering::SeqCst) as HWND;
+        if !settings.is_null() && IsWindow(settings) != 0 {
+            ShowWindow(hwnd, SW_SHOW);
+            position_settings_window(hwnd, settings, true);
+            SetForegroundWindow(settings);
+            return;
+        }
         if IsWindowVisible(hwnd) != 0 {
             ShowWindow(hwnd, SW_HIDE);
         } else {
@@ -3434,9 +3688,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         match command as usize {
             CMD_OPEN => show_popup(hwnd),
             CMD_SETTINGS => {
-                state().lock().unwrap().view = ViewMode::Settings;
-                resize_main_window(hwnd, true);
                 show_popup(hwnd);
+                show_settings(hwnd);
             }
             CMD_ABOUT => show_about(hwnd),
             CMD_UPDATE => request_manual_update(hwnd),
@@ -3446,6 +3699,50 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             }
             _ => {}
         }
+    }
+}
+
+unsafe extern "system" fn settings_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            unsafe {
+                paint_settings_window(hwnd);
+            }
+            0
+        }
+        WM_ERASEBKGND => 1,
+        WM_LBUTTONUP => {
+            let (x, y) = point_from_lparam(lparam);
+            let main_hwnd = unsafe { GetWindow(hwnd, GW_OWNER) };
+            if !main_hwnd.is_null() {
+                unsafe {
+                    handle_window_click(main_hwnd, hwnd, true, x, y);
+                }
+            }
+            0
+        }
+        WM_KEYDOWN if wparam as u32 == 0x1B => {
+            unsafe {
+                DestroyWindow(hwnd);
+            }
+            0
+        }
+        WM_CLOSE => {
+            unsafe {
+                DestroyWindow(hwnd);
+            }
+            0
+        }
+        WM_DESTROY => {
+            SETTINGS_HWND.store(0, Ordering::SeqCst);
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
@@ -3492,6 +3789,11 @@ unsafe extern "system" fn main_window_proc(
             unsafe {
                 resize_main_window(hwnd, true);
                 InvalidateRect(hwnd, null(), 0);
+                let settings = SETTINGS_HWND.load(Ordering::SeqCst) as HWND;
+                if !settings.is_null() && IsWindow(settings) != 0 {
+                    position_settings_window(hwnd, settings, false);
+                    InvalidateRect(settings, null(), 0);
+                }
                 let about = ABOUT_HWND.load(Ordering::SeqCst) as HWND;
                 if !about.is_null() && IsWindow(about) != 0 {
                     InvalidateRect(about, null(), 0);
@@ -3509,7 +3811,7 @@ unsafe extern "system" fn main_window_proc(
         WM_LBUTTONUP => {
             let (x, y) = point_from_lparam(lparam);
             unsafe {
-                handle_main_click(hwnd, x, y);
+                handle_window_click(hwnd, hwnd, false, x, y);
             }
             0
         }
@@ -3637,6 +3939,7 @@ unsafe extern "system" fn main_window_proc(
             if (wparam as u32 & 0xffff) == WA_INACTIVE
                 && !EXITING.load(Ordering::SeqCst)
                 && ABOUT_HWND.load(Ordering::SeqCst) == 0
+                && SETTINGS_HWND.load(Ordering::SeqCst) == 0
                 && CONFIRM_HWND.load(Ordering::SeqCst) == 0
             {
                 unsafe {
@@ -3679,6 +3982,10 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_DESTROY => {
             unsafe {
+                let settings = SETTINGS_HWND.swap(0, Ordering::SeqCst) as HWND;
+                if !settings.is_null() && IsWindow(settings) != 0 {
+                    DestroyWindow(settings);
+                }
                 KillTimer(hwnd, DATE_REFRESH_TIMER_ID);
                 KillTimer(hwnd, UPDATE_CHECK_TIMER_ID);
                 remove_tray_icon(hwnd);
@@ -3987,6 +4294,7 @@ unsafe extern "system" fn about_window_proc(
 fn register_window_classes(instance: HINSTANCE) -> bool {
     unsafe {
         let main_class_name = wide(MAIN_CLASS);
+        let settings_class_name = wide(SETTINGS_CLASS);
         let about_class_name = wide(ABOUT_CLASS);
         let confirm_class_name = wide(CONFIRM_CLASS);
         let main_class = WNDCLASSW {
@@ -4013,6 +4321,18 @@ fn register_window_classes(instance: HINSTANCE) -> bool {
             lpszMenuName: null(),
             lpszClassName: about_class_name.as_ptr(),
         };
+        let settings_class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+            lpfnWndProc: Some(settings_window_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: instance,
+            hIcon: load_app_icon(instance),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: settings_class_name.as_ptr(),
+        };
         let confirm_class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
             lpfnWndProc: Some(confirm_window_proc),
@@ -4026,6 +4346,7 @@ fn register_window_classes(instance: HINSTANCE) -> bool {
             lpszClassName: confirm_class_name.as_ptr(),
         };
         RegisterClassW(&main_class) != 0
+            && RegisterClassW(&settings_class) != 0
             && RegisterClassW(&about_class) != 0
             && RegisterClassW(&confirm_class) != 0
     }
