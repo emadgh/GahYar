@@ -1,0 +1,38 @@
+name: Release GahYar 2.7.2
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Publish v2.7.2
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v2.7.2 *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host 'Release v2.7.2 already exists.'
+            exit 0
+          }
+          gh release create v2.7.2 `
+            target/x86_64-pc-windows-msvc/release/GahYar.exe `
+            --target "${{ github.sha }}" `
+            --title "گاه‌یار v2.7.2" `
+            --notes-file RELEASE_NOTES.md `
+            --latest
