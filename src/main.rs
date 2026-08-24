@@ -2403,12 +2403,16 @@ unsafe fn create_tray_day_icon(day: u32) -> HICON {
         if screen.is_null() {
             return null_mut();
         }
-        let dc = CreateCompatibleDC(screen);
+        let color_dc = CreateCompatibleDC(screen);
+        let mask_dc = CreateCompatibleDC(screen);
         let color = CreateCompatibleBitmap(screen, 32, 32);
         let mask = CreateBitmap(32, 32, 1, 1, null());
-        if dc.is_null() || color.is_null() || mask.is_null() {
-            if !dc.is_null() {
-                DeleteDC(dc);
+        if color_dc.is_null() || mask_dc.is_null() || color.is_null() || mask.is_null() {
+            if !color_dc.is_null() {
+                DeleteDC(color_dc);
+            }
+            if !mask_dc.is_null() {
+                DeleteDC(mask_dc);
             }
             if !color.is_null() {
                 DeleteObject(color as HGDIOBJ);
@@ -2419,9 +2423,10 @@ unsafe fn create_tray_day_icon(day: u32) -> HICON {
             ReleaseDC(null_mut(), screen);
             return null_mut();
         }
-        let old_bitmap = SelectObject(dc, color as HGDIOBJ);
+
+        let old_color_bitmap = SelectObject(color_dc, color as HGDIOBJ);
         fill_rect_color(
-            dc,
+            color_dc,
             RECT {
                 left: 0,
                 top: 0,
@@ -2430,34 +2435,37 @@ unsafe fn create_tray_day_icon(day: u32) -> HICON {
             },
             rgb(248, 211, 88),
         );
-        draw_round_fill(
-            dc,
-            RECT {
-                left: 1,
-                top: 1,
-                right: 31,
-                bottom: 31,
-            },
-            rgb(248, 211, 88),
-            7,
-        );
-        let font = create_font(-22, FW_BOLD as i32, "Vazirmatn");
+
+        // A color icon's monochrome mask uses white pixels as transparent and black
+        // pixels as opaque. Shape the mask independently so the taskbar can show
+        // genuinely transparent corners on both light and dark themes.
+        let old_mask_bitmap = SelectObject(mask_dc, mask as HGDIOBJ);
+        PatBlt(mask_dc, 0, 0, 32, 32, WHITENESS);
+        let old_mask_brush = SelectObject(mask_dc, GetStockObject(BLACK_BRUSH) as HGDIOBJ);
+        let old_mask_pen = SelectObject(mask_dc, GetStockObject(BLACK_PEN) as HGDIOBJ);
+        RoundRect(mask_dc, 1, 1, 31, 31, 5, 5);
+        SelectObject(mask_dc, old_mask_pen);
+        SelectObject(mask_dc, old_mask_brush);
+
+        let font = create_font(-24, FW_BOLD as i32, "Vazirmatn");
         draw_text(
-            dc,
+            color_dc,
             &persian_digits(day),
             RECT {
                 left: 0,
-                top: 0,
+                top: 2,
                 right: 32,
-                bottom: 31,
+                bottom: 32,
             },
-            rgb(30, 31, 33),
+            rgb(18, 18, 18),
             font,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
         DeleteObject(font as HGDIOBJ);
-        SelectObject(dc, old_bitmap);
-        DeleteDC(dc);
+        SelectObject(color_dc, old_color_bitmap);
+        SelectObject(mask_dc, old_mask_bitmap);
+        DeleteDC(color_dc);
+        DeleteDC(mask_dc);
         ReleaseDC(null_mut(), screen);
 
         let info = ICONINFO {
@@ -2473,7 +2481,6 @@ unsafe fn create_tray_day_icon(day: u32) -> HICON {
         icon
     }
 }
-
 unsafe fn selected_tray_icon(app: &AppState) -> (HICON, bool) {
     unsafe {
         if app.settings.tray_day_icon {
