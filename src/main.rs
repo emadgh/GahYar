@@ -51,7 +51,7 @@ const BASE_HEIGHT_CALENDAR: i32 = 517;
 const BASE_EVENTS_HEIGHT: i32 = 136;
 const BASE_FOOTER_HEIGHT: i32 = 30;
 const BASE_UPDATE_HEIGHT: i32 = 42;
-const BASE_SETTINGS_HEIGHT: i32 = 834;
+const BASE_SETTINGS_HEIGHT: i32 = 878;
 const BASE_HEIGHT_COMPACT: i32 = 126;
 const BASE_ABOUT_WIDTH: i32 = 380;
 const BASE_ABOUT_HEIGHT: i32 = 300;
@@ -1604,6 +1604,15 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             palette,
             fonts,
             614,
+            "نمایش شماره انگلیسی در System Tray",
+            app.settings.tray_english_digits,
+        );
+        paint_toggle_row(
+            hdc,
+            app,
+            palette,
+            fonts,
+            658,
             "نمایش روزانه (بدون تقویم)",
             app.settings.compact_day,
         );
@@ -1612,7 +1621,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            658,
+            702,
             "اجرا همراه با ویندوز",
             app.settings.autostart,
         );
@@ -1643,9 +1652,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             hdc,
             sr(RECT {
                 left: 218,
-                top: 710,
+                top: 754,
                 right: 406,
-                bottom: 750,
+                bottom: 794,
             }),
             install_color,
             scaled(12, scale),
@@ -1655,9 +1664,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             install_label,
             sr(RECT {
                 left: 218,
-                top: 710,
+                top: 754,
                 right: 406,
-                bottom: 750,
+                bottom: 794,
             }),
             install_text_color,
             fonts.small,
@@ -1667,9 +1676,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             hdc,
             sr(RECT {
                 left: 24,
-                top: 710,
+                top: 754,
                 right: 212,
-                bottom: 750,
+                bottom: 794,
             }),
             if installed {
                 palette.holiday
@@ -1683,9 +1692,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             "حذف برنامه",
             sr(RECT {
                 left: 24,
-                top: 710,
+                top: 754,
                 right: 212,
-                bottom: 750,
+                bottom: 794,
             }),
             if installed {
                 palette.accent_text
@@ -1699,9 +1708,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             hdc,
             sr(RECT {
                 left: 24,
-                top: 757,
+                top: 801,
                 right: 406,
-                bottom: 799,
+                bottom: 843,
             }),
             palette.accent,
             scaled(12, scale),
@@ -1711,9 +1720,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             "بازنشانی تنظیمات",
             sr(RECT {
                 left: 24,
-                top: 757,
+                top: 801,
                 right: 406,
-                bottom: 799,
+                bottom: 843,
             }),
             palette.accent_text,
             fonts.medium,
@@ -2175,6 +2184,10 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                         app.settings.save();
                         refresh_tray_visual = true;
                     } else if (613..=656).contains(&y) {
+                        app.settings.tray_english_digits = !app.settings.tray_english_digits;
+                        app.settings.save();
+                        refresh_tray_visual = true;
+                    } else if (657..=700).contains(&y) {
                         app.settings.compact_day = !app.settings.compact_day;
                         if app.settings.compact_day && app.selected_day.is_none() {
                             let today = app.today_main();
@@ -2188,13 +2201,13 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                         app.event_scroll = 0;
                         app.settings.save();
                         resize = true;
-                    } else if (657..=704).contains(&y) {
+                    } else if (701..=748).contains(&y) {
                         let next = !app.settings.autostart;
                         if set_autostart(next) {
                             app.settings.autostart = next;
                             app.settings.save();
                         }
-                    } else if (706..=754).contains(&y) {
+                    } else if (750..=798).contains(&y) {
                         if x >= 215 {
                             if matches!(
                                 installation_state(),
@@ -2206,7 +2219,7 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                         } else {
                             uninstall_requested = true;
                         }
-                    } else if (755..=810).contains(&y) {
+                    } else if (799..=854).contains(&y) {
                         let default_settings = Settings::default();
                         let next_main = default_settings.main_calendar;
                         if next_main != app.settings.main_calendar {
@@ -2397,7 +2410,7 @@ unsafe fn load_app_icon(instance: HINSTANCE) -> HICON {
     unsafe { LoadIconW(instance, APP_ICON_ID as *const u16) }
 }
 
-unsafe fn create_tray_day_icon(day: u32) -> HICON {
+unsafe fn create_tray_day_icon(day: u32, english_digits: bool) -> HICON {
     unsafe {
         let screen = GetDC(null_mut());
         if screen.is_null() {
@@ -2447,10 +2460,20 @@ unsafe fn create_tray_day_icon(day: u32) -> HICON {
         SelectObject(mask_dc, old_mask_pen);
         SelectObject(mask_dc, old_mask_brush);
 
+        let day_text = if english_digits {
+            day.to_string()
+        } else {
+            persian_digits(day)
+        };
+        let text_format = if english_digits {
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE
+        } else {
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING
+        };
         let font = create_font(-24, FW_BOLD as i32, "Vazirmatn");
         draw_text(
             color_dc,
-            &persian_digits(day),
+            &day_text,
             RECT {
                 left: 0,
                 top: 2,
@@ -2459,7 +2482,7 @@ unsafe fn create_tray_day_icon(day: u32) -> HICON {
             },
             rgb(18, 18, 18),
             font,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+            text_format,
         );
         DeleteObject(font as HGDIOBJ);
         SelectObject(color_dc, old_color_bitmap);
@@ -2485,7 +2508,7 @@ unsafe fn selected_tray_icon(app: &AppState) -> (HICON, bool) {
     unsafe {
         if app.settings.tray_day_icon {
             let today = from_gregorian(CalendarKind::Jalali, app.today_gregorian);
-            let icon = create_tray_day_icon(today.day);
+            let icon = create_tray_day_icon(today.day, app.settings.tray_english_digits);
             if !icon.is_null() {
                 return (icon, true);
             }
