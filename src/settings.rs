@@ -60,6 +60,7 @@ pub struct Settings {
     pub show_tray_date: bool,
     pub auto_update: bool,
     pub tray_day_icon: bool,
+    pub tray_english_digits: bool,
     pub compact_day: bool,
     pub autostart: bool,
 }
@@ -79,6 +80,7 @@ impl Default for Settings {
             show_tray_date: true,
             auto_update: true,
             tray_day_icon: false,
+            tray_english_digits: false,
             compact_day: false,
             autostart: false,
         }
@@ -111,6 +113,7 @@ impl Settings {
                     "show_tray_date" => settings.show_tray_date = parse_bool(value),
                     "auto_update" => settings.auto_update = parse_bool(value),
                     "tray_day_icon" => settings.tray_day_icon = parse_bool(value),
+                    "tray_english_digits" => settings.tray_english_digits = parse_bool(value),
                     "compact_day" => settings.compact_day = parse_bool(value),
                     "autostart" => settings.autostart = parse_bool(value),
                     _ => {}
@@ -128,7 +131,7 @@ impl Settings {
             let _ = fs::create_dir_all(parent);
         }
         let text = format!(
-            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\ncompact_day={}\nautostart={}\n",
+            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\ntray_english_digits={}\ncompact_day={}\nautostart={}\n",
             self.theme.key(),
             self.ui_scale,
             self.main_calendar.key(),
@@ -141,6 +144,7 @@ impl Settings {
             self.show_tray_date,
             self.auto_update,
             self.tray_day_icon,
+            self.tray_english_digits,
             self.compact_day,
             self.autostart,
         );
