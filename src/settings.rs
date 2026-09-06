@@ -46,6 +46,47 @@ impl Theme {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayIconStyle {
+    TransparentWhite,
+    TransparentBlack,
+    YellowBlack,
+}
+
+impl TrayIconStyle {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::TransparentWhite => "transparent_white",
+            Self::TransparentBlack => "transparent_black",
+            Self::YellowBlack => "yellow_black",
+        }
+    }
+
+    pub fn from_key(value: &str) -> Self {
+        match value {
+            "transparent_white" => Self::TransparentWhite,
+            "transparent_black" => Self::TransparentBlack,
+            _ => Self::YellowBlack,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::TransparentWhite => "متن سفید",
+            Self::TransparentBlack => "متن مشکی",
+            Self::YellowBlack => "زرد + مشکی",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::TransparentWhite => Self::TransparentBlack,
+            Self::TransparentBlack => Self::YellowBlack,
+            Self::YellowBlack => Self::TransparentWhite,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub theme: Theme,
@@ -61,6 +102,7 @@ pub struct Settings {
     pub auto_update: bool,
     pub tray_day_icon: bool,
     pub tray_english_digits: bool,
+    pub tray_icon_style: TrayIconStyle,
     pub compact_day: bool,
     pub autostart: bool,
 }
@@ -81,6 +123,7 @@ impl Default for Settings {
             auto_update: true,
             tray_day_icon: false,
             tray_english_digits: false,
+            tray_icon_style: TrayIconStyle::YellowBlack,
             compact_day: false,
             autostart: false,
         }
@@ -114,6 +157,7 @@ impl Settings {
                     "auto_update" => settings.auto_update = parse_bool(value),
                     "tray_day_icon" => settings.tray_day_icon = parse_bool(value),
                     "tray_english_digits" => settings.tray_english_digits = parse_bool(value),
+                    "tray_icon_style" => settings.tray_icon_style = TrayIconStyle::from_key(value.trim()),
                     "compact_day" => settings.compact_day = parse_bool(value),
                     "autostart" => settings.autostart = parse_bool(value),
                     _ => {}
@@ -131,7 +175,7 @@ impl Settings {
             let _ = fs::create_dir_all(parent);
         }
         let text = format!(
-            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\ntray_english_digits={}\ncompact_day={}\nautostart={}\n",
+            "theme={}\nui_scale={}\nmain_calendar={}\ncalendar_rtl={}\nshow_jalali={}\nshow_gregorian={}\nshow_hijri={}\nshow_subtitles={}\nshow_events={}\nshow_tray_date={}\nauto_update={}\ntray_day_icon={}\ntray_english_digits={}\ntray_icon_style={}\ncompact_day={}\nautostart={}\n",
             self.theme.key(),
             self.ui_scale,
             self.main_calendar.key(),
@@ -145,6 +189,7 @@ impl Settings {
             self.auto_update,
             self.tray_day_icon,
             self.tray_english_digits,
+            self.tray_icon_style.key(),
             self.compact_day,
             self.autostart,
         );
