@@ -20,7 +20,7 @@ use calendar::{
     to_gregorian,
 };
 use events::{CalendarEvent, EventStore};
-use settings::{Settings, Theme, set_autostart};
+use settings::{Settings, Theme, TrayIconStyle, set_autostart};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -51,7 +51,7 @@ const BASE_HEIGHT_CALENDAR: i32 = 517;
 const BASE_EVENTS_HEIGHT: i32 = 136;
 const BASE_FOOTER_HEIGHT: i32 = 30;
 const BASE_UPDATE_HEIGHT: i32 = 42;
-const BASE_SETTINGS_HEIGHT: i32 = 878;
+const BASE_SETTINGS_HEIGHT: i32 = 922;
 const BASE_HEIGHT_COMPACT: i32 = 126;
 const BASE_ABOUT_WIDTH: i32 = 380;
 const BASE_ABOUT_HEIGHT: i32 = 300;
@@ -1607,12 +1607,21 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             "نمایش شماره انگلیسی در System Tray",
             app.settings.tray_english_digits,
         );
-        paint_toggle_row(
+        paint_value_row(
             hdc,
             app,
             palette,
             fonts,
             658,
+            "ظاهر شماره در System Tray",
+            app.settings.tray_icon_style.title(),
+        );
+        paint_toggle_row(
+            hdc,
+            app,
+            palette,
+            fonts,
+            702,
             "نمایش روزانه (بدون تقویم)",
             app.settings.compact_day,
         );
@@ -1621,7 +1630,7 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             app,
             palette,
             fonts,
-            702,
+            746,
             "اجرا همراه با ویندوز",
             app.settings.autostart,
         );
@@ -1652,9 +1661,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             hdc,
             sr(RECT {
                 left: 218,
-                top: 754,
+                top: 798,
                 right: 406,
-                bottom: 794,
+                bottom: 838,
             }),
             install_color,
             scaled(12, scale),
@@ -1664,9 +1673,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             install_label,
             sr(RECT {
                 left: 218,
-                top: 754,
+                top: 798,
                 right: 406,
-                bottom: 794,
+                bottom: 838,
             }),
             install_text_color,
             fonts.small,
@@ -1676,9 +1685,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             hdc,
             sr(RECT {
                 left: 24,
-                top: 754,
+                top: 798,
                 right: 212,
-                bottom: 794,
+                bottom: 838,
             }),
             if installed {
                 palette.holiday
@@ -1692,9 +1701,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             "حذف برنامه",
             sr(RECT {
                 left: 24,
-                top: 754,
+                top: 798,
                 right: 212,
-                bottom: 794,
+                bottom: 838,
             }),
             if installed {
                 palette.accent_text
@@ -1708,9 +1717,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             hdc,
             sr(RECT {
                 left: 24,
-                top: 801,
+                top: 845,
                 right: 406,
-                bottom: 843,
+                bottom: 887,
             }),
             palette.accent,
             scaled(12, scale),
@@ -1720,9 +1729,9 @@ unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             "بازنشانی تنظیمات",
             sr(RECT {
                 left: 24,
-                top: 801,
+                top: 845,
                 right: 406,
-                bottom: 843,
+                bottom: 887,
             }),
             palette.accent_text,
             fonts.medium,
@@ -2188,6 +2197,10 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                         app.settings.save();
                         refresh_tray_visual = true;
                     } else if (657..=700).contains(&y) {
+                        app.settings.tray_icon_style = app.settings.tray_icon_style.next();
+                        app.settings.save();
+                        refresh_tray_visual = true;
+                    } else if (701..=744).contains(&y) {
                         app.settings.compact_day = !app.settings.compact_day;
                         if app.settings.compact_day && app.selected_day.is_none() {
                             let today = app.today_main();
@@ -2201,13 +2214,13 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                         app.event_scroll = 0;
                         app.settings.save();
                         resize = true;
-                    } else if (701..=748).contains(&y) {
+                    } else if (745..=792).contains(&y) {
                         let next = !app.settings.autostart;
                         if set_autostart(next) {
                             app.settings.autostart = next;
                             app.settings.save();
                         }
-                    } else if (750..=798).contains(&y) {
+                    } else if (794..=842).contains(&y) {
                         if x >= 215 {
                             if matches!(
                                 installation_state(),
@@ -2219,7 +2232,7 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                         } else {
                             uninstall_requested = true;
                         }
-                    } else if (799..=854).contains(&y) {
+                    } else if (843..=898).contains(&y) {
                         let default_settings = Settings::default();
                         let next_main = default_settings.main_calendar;
                         if next_main != app.settings.main_calendar {
@@ -2410,7 +2423,11 @@ unsafe fn load_app_icon(instance: HINSTANCE) -> HICON {
     unsafe { LoadIconW(instance, APP_ICON_ID as *const u16) }
 }
 
-unsafe fn create_tray_day_icon(day: u32, english_digits: bool) -> HICON {
+unsafe fn create_tray_day_icon(
+    day: u32,
+    english_digits: bool,
+    style: TrayIconStyle,
+) -> HICON {
     unsafe {
         let screen = GetDC(null_mut());
         if screen.is_null() {
@@ -2446,19 +2463,24 @@ unsafe fn create_tray_day_icon(day: u32, english_digits: bool) -> HICON {
                 right: 32,
                 bottom: 32,
             },
-            rgb(248, 211, 88),
+            if style == TrayIconStyle::YellowBlack {
+                rgb(248, 211, 88)
+            } else {
+                rgb(0, 0, 0)
+            },
         );
 
-        // A color icon's monochrome mask uses white pixels as transparent and black
-        // pixels as opaque. Shape the mask independently so the taskbar can show
-        // genuinely transparent corners on both light and dark themes.
+        // White pixels in the monochrome mask are transparent; black pixels are opaque.
+        // The yellow mode keeps the rounded tile. Transparent modes only mark glyphs opaque.
         let old_mask_bitmap = SelectObject(mask_dc, mask as HGDIOBJ);
         PatBlt(mask_dc, 0, 0, 32, 32, WHITENESS);
-        let old_mask_brush = SelectObject(mask_dc, GetStockObject(BLACK_BRUSH) as HGDIOBJ);
-        let old_mask_pen = SelectObject(mask_dc, GetStockObject(BLACK_PEN) as HGDIOBJ);
-        RoundRect(mask_dc, 1, 1, 31, 31, 5, 5);
-        SelectObject(mask_dc, old_mask_pen);
-        SelectObject(mask_dc, old_mask_brush);
+        if style == TrayIconStyle::YellowBlack {
+            let old_mask_brush = SelectObject(mask_dc, GetStockObject(BLACK_BRUSH) as HGDIOBJ);
+            let old_mask_pen = SelectObject(mask_dc, GetStockObject(BLACK_PEN) as HGDIOBJ);
+            RoundRect(mask_dc, 1, 1, 31, 31, 5, 5);
+            SelectObject(mask_dc, old_mask_pen);
+            SelectObject(mask_dc, old_mask_brush);
+        }
 
         let day_text = if english_digits {
             day.to_string()
@@ -2470,20 +2492,53 @@ unsafe fn create_tray_day_icon(day: u32, english_digits: bool) -> HICON {
         } else {
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING
         };
-        let font = create_font(-24, FW_BOLD as i32, "Vazirmatn");
-        draw_text(
-            color_dc,
-            &day_text,
+        let text_rect = if english_digits {
+            RECT {
+                left: 2,
+                top: 2,
+                right: 30,
+                bottom: 31,
+            }
+        } else {
             RECT {
                 left: 0,
                 top: 2,
                 right: 32,
                 bottom: 32,
-            },
-            rgb(18, 18, 18),
+            }
+        };
+        let font = if english_digits {
+            create_font(-22, FW_BOLD as i32, "Segoe UI")
+        } else {
+            create_font(-24, FW_BOLD as i32, "Vazirmatn")
+        };
+        if english_digits {
+            // Segoe UI plus slight negative tracking keeps two-digit days compact and centered.
+            SetTextCharacterExtra(color_dc, -2);
+            SetTextCharacterExtra(mask_dc, -2);
+        }
+        let text_color = match style {
+            TrayIconStyle::TransparentWhite => rgb(255, 255, 255),
+            TrayIconStyle::TransparentBlack | TrayIconStyle::YellowBlack => rgb(18, 18, 18),
+        };
+        draw_text(
+            color_dc,
+            &day_text,
+            text_rect,
+            text_color,
             font,
             text_format,
         );
+        if style != TrayIconStyle::YellowBlack {
+            draw_text(
+                mask_dc,
+                &day_text,
+                text_rect,
+                rgb(0, 0, 0),
+                font,
+                text_format,
+            );
+        }
         DeleteObject(font as HGDIOBJ);
         SelectObject(color_dc, old_color_bitmap);
         SelectObject(mask_dc, old_mask_bitmap);
@@ -2508,7 +2563,11 @@ unsafe fn selected_tray_icon(app: &AppState) -> (HICON, bool) {
     unsafe {
         if app.settings.tray_day_icon {
             let today = from_gregorian(CalendarKind::Jalali, app.today_gregorian);
-            let icon = create_tray_day_icon(today.day, app.settings.tray_english_digits);
+            let icon = create_tray_day_icon(
+                today.day,
+                app.settings.tray_english_digits,
+                app.settings.tray_icon_style,
+            );
             if !icon.is_null() {
                 return (icon, true);
             }
