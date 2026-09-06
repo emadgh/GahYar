@@ -2507,10 +2507,21 @@ unsafe fn create_tray_day_icon(
                 bottom: 32,
             }
         };
+        let transparent_style = style != TrayIconStyle::YellowBlack;
         let font = if english_digits {
-            create_font(-22, FW_BOLD as i32, "Segoe UI")
+            // English digits use a regular weight. Transparent modes get a larger glyph.
+            create_font(
+                if transparent_style { -26 } else { -22 },
+                FW_NORMAL as i32,
+                "Segoe UI",
+            )
         } else {
-            create_font(-24, FW_BOLD as i32, "Vazirmatn")
+            // Persian digits stay bold. Transparent modes get a larger glyph.
+            create_font(
+                if transparent_style { -28 } else { -24 },
+                FW_BOLD as i32,
+                "Vazirmatn",
+            )
         };
         if english_digits {
             // Segoe UI plus slight negative tracking keeps two-digit days compact and centered.
