@@ -9,6 +9,8 @@ static OWNER: AtomicIsize = AtomicIsize::new(0);
 static SCROLL: AtomicI32 = AtomicI32::new(0);
 static DISPLAY_SCALE: AtomicU32 = AtomicU32::new(100);
 const CLASS: &str = "GahYarSettings";
+const FIRST_RUN_TIMER_ID: usize = 0xF17A;
+const WM_FIRST_RUN_INSTALL: u32 = WM_APP + 50;
 
 pub fn display_scale() -> u32 {
     DISPLAY_SCALE.load(Ordering::SeqCst)
@@ -110,6 +112,32 @@ pub fn show(main: HWND) {
     }
 }
 
+/// Runs after the main window has completed WM_CREATE. Keeping onboarding out of
+/// WM_CREATE avoids re-entering the main window while the installation dialog
+/// is running its modal message loop.
+unsafe extern "system" fn first_run_timer_proc(
+    main: HWND,
+    _message: u32,
+    timer_id: usize,
+    _time: u32,
+) {
+    unsafe {
+        KillTimer(main, timer_id);
+        if main.is_null() || IsWindow(main) == 0 {
+            return;
+        }
+
+        show_popup(main);
+        show(main);
+        settings_panel::select_page(4);
+
+        let hwnd = window();
+        if !hwnd.is_null() && IsWindow(hwnd) != 0 {
+            PostMessageW(hwnd, WM_FIRST_RUN_INSTALL, 0, 0);
+        }
+    }
+}
+
 // Keep the pair within the selected monitor, preferring the left of the calendar.
 fn positions(work: RECT, calendar: RECT, width: i32, height: i32) -> (i32, i32, i32) {
     let gap = 8;
@@ -135,6 +163,22 @@ fn positions(work: RECT, calendar: RECT, width: i32, height: i32) -> (i32, i32, 
 }
 
 pub fn reposition() {
+    // `resize_main_window` is called during the main window's first WM_CREATE,
+    // which gives us a safe place to schedule (not execute) first-run UI. A
+    // TIMERPROC runs on the same UI thread once the normal message loop starts.
+    if settings::take_first_run_onboarding() {
+        unsafe {
+            let class = wide(MAIN_CLASS);
+            let main = FindWindowW(class.as_ptr(), null());
+            if main.is_null()
+                || SetTimer(main, FIRST_RUN_TIMER_ID, 1, Some(first_run_timer_proc)) == 0
+            {
+                settings::defer_first_run_onboarding();
+            }
+        }
+        return;
+    }
+
     let hwnd = window();
     let main = owner();
     if hwnd.is_null() || main.is_null() {
@@ -255,6 +299,37 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_ERASEBKGND => 1,
+        WM_FIRST_RUN_INSTALL => {
+            let main = owner();
+            if main.is_null() || unsafe { IsWindow(main) } == 0 {
+                return 0;
+            }
+
+            let offer_install = matches!(
+                installation_state(),
+                InstallationState::NotInstalled | InstallationState::UpdateAvailable
+            );
+            let exiting = offer_install && unsafe { request_install(hwnd) };
+            if exiting {
+                EXITING.store(true, Ordering::SeqCst);
+                unsafe {
+                    DestroyWindow(main);
+                }
+                return 0;
+            }
+
+            if settings::take_first_run_autostart_failed() {
+                unsafe {
+                    show_message(
+                        hwnd,
+                        "اجرای همراه ویندوز",
+                        "فعال‌کردن اجرای خودکار ناموفق بود. می‌توانید بعداً آن را از بخش «رفتار برنامه» فعال کنید.",
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
+            }
+            0
+        }
         WM_ACTIVATE => {
             if (wparam as u32 & 0xffff) == WA_INACTIVE {
                 unsafe {
