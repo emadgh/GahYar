@@ -1943,7 +1943,7 @@ unsafe fn create_tray_day_icon(
 unsafe fn selected_tray_icon(app: &AppState) -> (HICON, bool) {
     unsafe {
         if app.settings.tray_day_icon {
-            let today = from_gregorian(CalendarKind::Jalali, app.today_gregorian);
+            let today = from_gregorian(app.settings.main_calendar, app.today_gregorian);
             let icon = create_tray_day_icon(
                 today.day,
                 app.settings.tray_english_digits,
