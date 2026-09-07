@@ -2495,24 +2495,24 @@ unsafe fn create_tray_day_icon(
         let text_rect = if english_digits {
             RECT {
                 left: 2,
-                top: 2,
+                top: -1,
                 right: 30,
-                bottom: 31,
+                bottom: 28,
             }
         } else {
             RECT {
                 left: 0,
-                top: 2,
+                top: 3,
                 right: 32,
-                bottom: 32,
+                bottom: 33,
             }
         };
         let transparent_style = style != TrayIconStyle::YellowBlack;
         let font = if english_digits {
-            // English digits use a regular weight. Transparent modes get a larger glyph.
+            // English digits use a bold weight. Transparent modes get a larger glyph.
             create_font(
                 if transparent_style { -26 } else { -22 },
-                FW_NORMAL as i32,
+                FW_BOLD as i32,
                 "Segoe UI",
             )
         } else {
