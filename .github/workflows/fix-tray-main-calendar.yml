@@ -1,0 +1,44 @@
+name: Fix tray main calendar day
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [fix/tray-main-calendar-day]
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/tray-main-calendar-day
+      - name: Make tray day follow main calendar
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/main.rs')
+          text = path.read_text(encoding='utf-8')
+          old = 'let today = from_gregorian(CalendarKind::Jalali, app.today_gregorian);'
+          new = 'let today = from_gregorian(app.settings.main_calendar, app.today_gregorian);'
+          marker = 'unsafe fn selected_tray_icon(app: &AppState) -> (HICON, bool) {'
+          if marker not in text:
+              raise SystemExit('selected_tray_icon marker not found')
+          before, selected = text.split(marker, 1)
+          if old not in selected:
+              raise SystemExit('Tray conversion not found after selected_tray_icon marker')
+          selected = selected.replace(old, new, 1)
+          path.write_text(before + marker + selected, encoding='utf-8')
+          PY
+      - name: Remove temporary workflow
+        run: git rm .github/workflows/fix-tray-main-calendar.yml
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main.rs
+          git commit -m "fix: make tray day follow main calendar"
+          git push origin HEAD:fix/tray-main-calendar-day
