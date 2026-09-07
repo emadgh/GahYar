@@ -44,8 +44,8 @@ dependencies = [
 
 [[package]]
 name = "rust-colorpicker"
-version = "0.1.0"
-source = "git+https://github.com/emadgh/rust-colorpicker?rev=2690b88763bd5b99f26f7ad032fea2217fb5a040#2690b88763bd5b99f26f7ad032fea2217fb5a040"
+version = "0.2.0"
+source = "git+https://github.com/emadgh/rust-colorpicker?rev=27353da14f095f77bb845684ea6b2bbb0481c10f#27353da14f095f77bb845684ea6b2bbb0481c10f"
 dependencies = [
  "windows-sys",
 ]

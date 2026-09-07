@@ -1,20 +1,13 @@
-//! Inline Win32 settings controls using the system-provided color dialog.
+//! Inline Win32 settings controls using rust-colorpicker's native dialog.
 use crate::{AppState, Fonts, Palette, Settings, theme::ThemeColors};
 use rust_colorpicker::{Color, ColorPicker};
 use std::ptr::null;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 static OPEN: AtomicBool = AtomicBool::new(false);
-static PICKER: LazyLock<Mutex<ColorPicker>> = LazyLock::new(|| {
-    let mut picker = ColorPicker::new();
-    picker.set_custom_colors([Color::rgb(255, 255, 255); 16]);
-    Mutex::new(picker)
-});
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Accent,
@@ -131,10 +124,10 @@ pub fn open(hwnd: HWND, target: Target) {
         Target::Primary => colors.primary,
         Target::Accent => colors.accent,
     };
-    // Never hold application/custom-color locks while the common dialog pumps messages.
-    let mut picker = PICKER.lock().unwrap().clone();
+    // Settings store RGB, so keep the package's optional alpha control hidden.
+    let mut picker = ColorPicker::new();
+    picker.set_show_alpha(false);
     let result = picker.pick_with_owner(hwnd, Color::rgb(initial[0], initial[1], initial[2]));
-    *PICKER.lock().unwrap() = picker;
     OPEN.store(false, Ordering::SeqCst);
     if unsafe { IsWindow(hwnd) } == 0 {
         return;
@@ -200,13 +193,13 @@ mod tests {
     // only accepts/cancels a dialog owned by our temporary test window.
     #[test]
     #[ignore = "opens native Windows dialogs for integration QA"]
-    fn native_package_accept_cancel_and_swatches() {
+    fn native_package_accept_cancel_and_preserve_alpha() {
         use std::sync::atomic::AtomicUsize;
-        static ACTION: AtomicUsize = AtomicUsize::new(1);
+        static ACTION: AtomicUsize = AtomicUsize::new(0x0D);
         unsafe extern "system" fn visit(window: HWND, owner: LPARAM) -> i32 {
             if unsafe { GetWindow(window, GW_OWNER) } == owner as HWND {
                 unsafe {
-                    PostMessageW(window, WM_COMMAND, ACTION.load(Ordering::SeqCst), 0);
+                    PostMessageW(window, WM_KEYDOWN, ACTION.load(Ordering::SeqCst), 0);
                 }
             }
             1
@@ -238,17 +231,16 @@ mod tests {
             assert!(!owner.is_null());
             assert_ne!(SetTimer(owner, 1, 100, Some(finish)), 0);
             let mut picker = ColorPicker::new();
-            let swatches = std::array::from_fn(|i| Color::rgb(i as u8 * 16, 40, 90));
-            picker.set_custom_colors(swatches);
+            picker.set_show_alpha(false);
             let initial = Color::rgba(18, 52, 86, 123);
             let accepted = picker.pick_with_owner(owner, initial);
-            ACTION.store(2, Ordering::SeqCst);
+            ACTION.store(0x1B, Ordering::SeqCst);
             let cancelled = picker.pick_with_owner(owner, initial);
             KillTimer(owner, 1);
             DestroyWindow(owner);
             assert_eq!(accepted, Ok(Some(initial)));
             assert_eq!(cancelled, Ok(None));
-            assert_eq!(picker.custom_colors(), &swatches);
+            assert!(!picker.show_alpha());
         }
     }
 
