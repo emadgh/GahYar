@@ -109,7 +109,7 @@ impl Default for Settings {
             theme: Theme::Dark,
             primary: None,
             accent: None,
-            ui_scale: 100,
+            ui_scale: 90,
             main_calendar: CalendarKind::Jalali,
             calendar_rtl: true,
             show_jalali: true,
@@ -119,12 +119,12 @@ impl Default for Settings {
             show_events: true,
             show_tray_date: true,
             auto_update: true,
-            tray_day_icon: false,
+            tray_day_icon: true,
             tray_english_digits: false,
-            tray_text_white: false,
-            tray_accent_background: true,
+            tray_text_white: true,
+            tray_accent_background: false,
             compact_day: false,
-            autostart: false,
+            autostart: true,
         }
     }
 }
@@ -162,7 +162,7 @@ impl Settings {
                     "accent" => settings.accent = crate::theme::parse_hex(value),
                     "ui_scale" => {
                         settings.ui_scale =
-                            value.trim().parse::<u32>().unwrap_or(100).clamp(80, 125)
+                            value.trim().parse::<u32>().unwrap_or(90).clamp(80, 125)
                     }
                     "main_calendar" => {
                         settings.main_calendar = CalendarKind::from_key(value.trim())
@@ -273,6 +273,13 @@ impl Settings {
     }
 }
 
+/// Returns true only before GahYar has created its per-user settings file.
+/// This is used to gate the first-run onboarding flow without disturbing
+/// existing users or re-showing the install prompt after a restart.
+pub fn is_first_run() -> bool {
+    !settings_path().is_file()
+}
+
 pub fn set_autostart(enabled: bool) -> bool {
     if !enabled && !is_autostart_enabled() {
         return true;
@@ -322,6 +329,19 @@ fn settings_path() -> PathBuf {
 mod tests {
     use super::*;
     use crate::theme::ThemeColors;
+
+    #[test]
+    fn first_run_defaults_match_product_profile() {
+        let settings = Settings::default();
+        assert_eq!(settings.theme, Theme::Dark);
+        assert_eq!(settings.ui_scale, 90);
+        assert_eq!(settings.main_calendar, CalendarKind::Jalali);
+        assert!(settings.tray_day_icon);
+        assert!(!settings.tray_english_digits);
+        assert!(settings.tray_text_white);
+        assert!(!settings.tray_accent_background);
+        assert!(settings.autostart);
+    }
 
     #[test]
     fn tray_appearance_migration_and_independent_choices_round_trip() {
