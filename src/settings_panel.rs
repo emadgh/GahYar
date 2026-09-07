@@ -689,13 +689,16 @@ fn apply(hwnd: HWND, action: Action, index: usize) {
             }
             Action::AutoUpdate => app.settings.auto_update = !app.settings.auto_update,
             Action::Reset => {
-                if app.settings.autostart && !set_autostart(false) {
+                let defaults = Settings::default();
+                if app.settings.autostart != defaults.autostart
+                    && !set_autostart(defaults.autostart)
+                {
                     drop(app);
-                    color_picker::report_error(hwnd, "غیرفعال کردن اجرای خودکار ممکن نشد.");
+                    color_picker::report_error(hwnd, "بازگردانی اجرای خودکار ممکن نشد.");
                     return;
                 }
-                app.set_main_calendar(Settings::default().main_calendar);
-                app.settings = Settings::default();
+                app.set_main_calendar(defaults.main_calendar);
+                app.settings = defaults;
             }
             _ => {}
         }
