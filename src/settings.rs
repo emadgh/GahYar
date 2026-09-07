@@ -2,12 +2,16 @@ use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::calendar::CalendarKind;
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "GahYar";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+static FIRST_RUN_ONBOARDING_PENDING: AtomicBool = AtomicBool::new(false);
+static FIRST_RUN_AUTOSTART_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Theme {
@@ -109,7 +113,7 @@ impl Default for Settings {
             theme: Theme::Dark,
             primary: None,
             accent: None,
-            ui_scale: 100,
+            ui_scale: 90,
             main_calendar: CalendarKind::Jalali,
             calendar_rtl: true,
             show_jalali: true,
@@ -119,22 +123,42 @@ impl Default for Settings {
             show_events: true,
             show_tray_date: true,
             auto_update: true,
-            tray_day_icon: false,
+            tray_day_icon: true,
             tray_english_digits: false,
-            tray_text_white: false,
-            tray_accent_background: true,
+            tray_text_white: true,
+            tray_accent_background: false,
             compact_day: false,
-            autostart: false,
+            autostart: true,
         }
     }
 }
 
 impl Settings {
     pub fn load() -> Self {
-        let text = fs::read_to_string(settings_path()).unwrap_or_default();
+        let path = settings_path();
+        let first_run = !path.is_file();
+        let text = fs::read_to_string(&path).unwrap_or_default();
         let mut settings = Self::from_text(&text);
-        // The registry is the source of truth for the startup setting.
-        settings.autostart = is_autostart_enabled();
+
+        if first_run {
+            // Apply the product defaults to external state before the first UI
+            // is created. The install flow later relocates this Run entry to
+            // Program Files when the user chooses to install.
+            let autostart_enabled = set_autostart(settings.autostart);
+            settings.autostart = autostart_enabled;
+            FIRST_RUN_AUTOSTART_FAILED.store(!autostart_enabled, Ordering::SeqCst);
+            FIRST_RUN_ONBOARDING_PENDING.store(true, Ordering::SeqCst);
+
+            // Persist before showing the install question. If installation is
+            // accepted, the current process exits and the installed copy starts;
+            // it must not interpret that restart as another first launch.
+            let _ = settings.save_to(&path);
+        } else {
+            // The registry is the source of truth for the startup setting for
+            // established installations/users.
+            settings.autostart = is_autostart_enabled();
+        }
+
         settings
     }
 
@@ -162,7 +186,7 @@ impl Settings {
                     "accent" => settings.accent = crate::theme::parse_hex(value),
                     "ui_scale" => {
                         settings.ui_scale =
-                            value.trim().parse::<u32>().unwrap_or(100).clamp(80, 125)
+                            value.trim().parse::<u32>().unwrap_or(90).clamp(80, 125)
                     }
                     "main_calendar" => {
                         settings.main_calendar = CalendarKind::from_key(value.trim())
@@ -273,6 +297,26 @@ impl Settings {
     }
 }
 
+/// Returns true only before GahYar has created its per-user settings file.
+pub fn is_first_run() -> bool {
+    !settings_path().is_file()
+}
+
+/// Consumes the one-shot first-run UI request initialized by [`Settings::load`].
+pub fn take_first_run_onboarding() -> bool {
+    FIRST_RUN_ONBOARDING_PENDING.swap(false, Ordering::SeqCst)
+}
+
+/// Requeues onboarding when the main HWND is not ready yet.
+pub fn defer_first_run_onboarding() {
+    FIRST_RUN_ONBOARDING_PENDING.store(true, Ordering::SeqCst);
+}
+
+/// Reports the first-run registry failure once so the UI can explain it.
+pub fn take_first_run_autostart_failed() -> bool {
+    FIRST_RUN_AUTOSTART_FAILED.swap(false, Ordering::SeqCst)
+}
+
 pub fn set_autostart(enabled: bool) -> bool {
     if !enabled && !is_autostart_enabled() {
         return true;
@@ -322,6 +366,19 @@ fn settings_path() -> PathBuf {
 mod tests {
     use super::*;
     use crate::theme::ThemeColors;
+
+    #[test]
+    fn first_run_defaults_match_product_profile() {
+        let settings = Settings::default();
+        assert_eq!(settings.theme, Theme::Dark);
+        assert_eq!(settings.ui_scale, 90);
+        assert_eq!(settings.main_calendar, CalendarKind::Jalali);
+        assert!(settings.tray_day_icon);
+        assert!(!settings.tray_english_digits);
+        assert!(settings.tray_text_white);
+        assert!(!settings.tray_accent_background);
+        assert!(settings.autostart);
+    }
 
     #[test]
     fn tray_appearance_migration_and_independent_choices_round_trip() {
