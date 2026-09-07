@@ -1,8 +1,12 @@
 #![windows_subsystem = "windows"]
 
 mod calendar;
+mod color_picker;
 mod events;
 mod settings;
+mod settings_panel;
+mod settings_window;
+mod theme;
 mod update;
 
 use std::ffi::c_void;
@@ -20,7 +24,7 @@ use calendar::{
     to_gregorian,
 };
 use events::{CalendarEvent, EventStore};
-use settings::{Settings, Theme, TrayIconStyle, set_autostart};
+use settings::{Settings, Theme, set_autostart};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -51,7 +55,7 @@ const BASE_HEIGHT_CALENDAR: i32 = 517;
 const BASE_EVENTS_HEIGHT: i32 = 136;
 const BASE_FOOTER_HEIGHT: i32 = 30;
 const BASE_UPDATE_HEIGHT: i32 = 42;
-const BASE_SETTINGS_HEIGHT: i32 = 922;
+const BASE_SETTINGS_HEIGHT: i32 = 966;
 const BASE_HEIGHT_COMPACT: i32 = 126;
 const BASE_ABOUT_WIDTH: i32 = 380;
 const BASE_ABOUT_HEIGHT: i32 = 300;
@@ -73,6 +77,7 @@ const WM_SHOW_EXISTING: u32 = WM_APP + 2;
 const WM_UPDATE_STATUS: u32 = WM_APP + 3;
 const WM_APPLY_UPDATE: u32 = WM_APP + 4;
 const WM_MOUSE_LEAVE: u32 = 0x02A3;
+const WM_DISMISS_POPUPS: u32 = WM_APP + 10;
 const TRAY_ID: u32 = 1;
 const CMD_OPEN: usize = 1001;
 const CMD_SETTINGS: usize = 1002;
@@ -108,7 +113,6 @@ struct AppState {
     year: i32,
     month: u32,
     selected_day: Option<u32>,
-    view: ViewMode,
     event_scroll: usize,
     hovered_cell: Option<i32>,
 }
@@ -136,19 +140,22 @@ impl AppState {
             year: today_main.year,
             month: today_main.month,
             selected_day: Some(today_main.day),
-            view: ViewMode::Calendar,
             event_scroll: 0,
             hovered_cell: None,
         }
     }
 
     fn base_height(&self) -> i32 {
+        self.base_height_for(ViewMode::Calendar)
+    }
+
+    fn base_height_for(&self, view: ViewMode) -> i32 {
         let update_height = if !self.settings.auto_update && update::banner_visible() {
             BASE_UPDATE_HEIGHT
         } else {
             0
         };
-        (if self.view == ViewMode::Settings {
+        (if view == ViewMode::Settings {
             BASE_SETTINGS_HEIGHT + BASE_FOOTER_HEIGHT
         } else {
             (if self.settings.compact_day {
@@ -273,6 +280,7 @@ struct Palette {
     faint: COLORREF,
     accent: COLORREF,
     accent_text: COLORREF,
+    accent_label: COLORREF,
     holiday: COLORREF,
     border: COLORREF,
     event: COLORREF,
@@ -280,6 +288,49 @@ struct Palette {
 }
 
 impl Palette {
+    fn from_colors(colors: theme::ThemeColors) -> Self {
+        if !colors.is_custom() {
+            return Self::from_theme(colors.theme);
+        }
+        let primary = colors.primary;
+        let fg = theme::foreground(primary);
+        // Changing only accent must retain the preset's surface hierarchy.
+        let [surface, surface_alt, panel] =
+            if primary == theme::ThemeColors::preset(colors.theme).primary {
+                let preset = Self::from_theme(colors.theme);
+                [preset.surface, preset.surface_alt, preset.calendar_panel]
+                    .map(|v| [v as u8, (v >> 8) as u8, (v >> 16) as u8])
+            } else {
+                theme::surfaces(primary)
+            };
+        let mut selected = panel;
+        for step in (0..=12).rev() {
+            let candidate = theme::mix(panel, colors.accent, step as f32 / 100.0);
+            if theme::contrast(candidate, fg) >= 4.5 {
+                selected = candidate;
+                break;
+            }
+        }
+        let backgrounds = [primary, surface, surface_alt, panel, selected];
+        let c = |v: [u8; 3]| rgb(v[0], v[1], v[2]);
+        Self {
+            background: c(primary),
+            surface: c(surface),
+            surface_alt: c(surface_alt),
+            calendar_panel: c(panel),
+            text: c(theme::readable(fg, &backgrounds)),
+            muted: c(theme::readable(theme::mix(primary, fg, 0.65), &backgrounds)),
+            faint: c(theme::mix(primary, fg, 0.4)),
+            accent: c(colors.accent),
+            accent_text: c(theme::foreground(colors.accent)),
+            accent_label: c(theme::readable(colors.accent, &backgrounds)),
+            holiday: c(theme::readable([230, 65, 65], &backgrounds)),
+            border: c(theme::mix(primary, fg, 0.18)),
+            event: c(theme::readable([60, 140, 240], &backgrounds)),
+            selected: c(selected),
+        }
+    }
+
     fn from_theme(theme: Theme) -> Self {
         match theme {
             Theme::Dark => Self {
@@ -292,6 +343,7 @@ impl Palette {
                 faint: rgb(91, 97, 104),
                 accent: rgb(248, 211, 88),
                 accent_text: rgb(24, 24, 24),
+                accent_label: rgb(248, 211, 88),
                 holiday: rgb(255, 104, 104),
                 border: rgb(70, 70, 70),
                 event: rgb(126, 180, 255),
@@ -307,6 +359,7 @@ impl Palette {
                 faint: rgb(176, 181, 188),
                 accent: rgb(230, 181, 43),
                 accent_text: rgb(29, 25, 12),
+                accent_label: rgb(230, 181, 43),
                 holiday: rgb(206, 49, 49),
                 border: rgb(211, 214, 219),
                 event: rgb(32, 100, 191),
@@ -605,7 +658,7 @@ fn move_calendar_day(app: &mut AppState, delta: i32) {
     app.event_scroll = 0;
 }
 
-unsafe fn paint_main(hwnd: HWND) {
+unsafe fn paint_main(hwnd: HWND, view: ViewMode, scroll: i32) {
     unsafe {
         let mut ps: PAINTSTRUCT = zeroed();
         let window_hdc = BeginPaint(hwnd, &mut ps);
@@ -614,11 +667,29 @@ unsafe fn paint_main(hwnd: HWND) {
         }
 
         let app = state().lock().unwrap();
-        let scale = app.scale();
-        let palette = Palette::from_theme(app.settings.theme);
+        let scale = if view == ViewMode::Settings {
+            settings_window::display_scale()
+        } else {
+            app.scale()
+        };
+        let palette = Palette::from_colors(theme::ThemeColors::from_settings(&app.settings));
         let fonts = Fonts::create(scale);
-        let width = scaled(BASE_WIDTH, scale);
-        let height = scaled(app.base_height(), scale);
+        let width = scaled(
+            if view == ViewMode::Settings {
+                settings_panel::WIDTH
+            } else {
+                BASE_WIDTH
+            },
+            scale,
+        );
+        let height = scaled(
+            if view == ViewMode::Settings {
+                settings_panel::HEIGHT
+            } else {
+                app.base_height_for(view)
+            },
+            scale,
+        );
         let hdc = CreateCompatibleDC(window_hdc);
         let bitmap = CreateCompatibleBitmap(window_hdc, width, height);
         if hdc.is_null() || bitmap.is_null() {
@@ -656,9 +727,9 @@ unsafe fn paint_main(hwnd: HWND) {
             scaled(18, scale),
         );
 
-        match app.view {
+        match view {
             ViewMode::Calendar => paint_calendar(hdc, &app, &palette, &fonts),
-            ViewMode::Settings => paint_settings(hdc, &app, &palette, &fonts),
+            ViewMode::Settings => settings_panel::paint(hdc, &app, &palette, &fonts, scale),
         }
 
         draw_round_outline(
@@ -673,7 +744,19 @@ unsafe fn paint_main(hwnd: HWND) {
             scaled(18, scale),
             1,
         );
-        BitBlt(window_hdc, 0, 0, width, height, hdc, 0, 0, SRCCOPY);
+        let mut client: RECT = zeroed();
+        GetClientRect(hwnd, &mut client);
+        BitBlt(
+            window_hdc,
+            0,
+            0,
+            width,
+            client.bottom,
+            hdc,
+            0,
+            scroll,
+            SRCCOPY,
+        );
         SelectObject(hdc, old_bitmap);
         DeleteObject(bitmap as HGDIOBJ);
         DeleteDC(hdc);
@@ -709,7 +792,7 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
                 right: 66,
                 bottom: 44,
             }),
-            palette.accent,
+            palette.accent_label,
             fonts.icon,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
@@ -733,58 +816,62 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
                 right: 416,
                 bottom: 44,
             }),
-            palette.accent,
+            palette.accent_label,
             fonts.icon,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
+
+        let today = app.today_main();
+        let today_is_active = app.year == today.year
+            && app.month == today.month
+            && app.selected_day == Some(today.day);
+        let date_block_offset = if today_is_active { 5 } else { 0 };
 
         draw_text(
             hdc,
             &main_date_heading(app),
             sr(RECT {
                 left: 72,
-                top: 7,
+                top: 7 + date_block_offset,
                 right: 358,
-                bottom: 43,
+                bottom: 43 + date_block_offset,
             }),
-            palette.accent,
+            palette.accent_label,
             fonts.medium,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
 
         let compact = app.settings.compact_day;
-        if !compact {
-            let ranges = secondary_ranges(app);
-            if let Some(first) = ranges.first() {
-                draw_text(
-                    hdc,
-                    first,
-                    sr(RECT {
-                        left: 58,
-                        top: 44,
-                        right: 372,
-                        bottom: 62,
-                    }),
-                    palette.text,
-                    fonts.small,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-                );
-            }
-            if let Some(second) = ranges.get(1) {
-                draw_text(
-                    hdc,
-                    second,
-                    sr(RECT {
-                        left: 58,
-                        top: 62,
-                        right: 372,
-                        bottom: 80,
-                    }),
-                    palette.muted,
-                    fonts.small,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-                );
-            }
+        let ranges = secondary_ranges(app);
+        if let Some(first) = ranges.first() {
+            draw_text(
+                hdc,
+                first,
+                sr(RECT {
+                    left: 58,
+                    top: 44 + date_block_offset,
+                    right: 372,
+                    bottom: 62 + date_block_offset,
+                }),
+                palette.text,
+                fonts.small,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+            );
+        }
+        if let Some(second) = ranges.get(1) {
+            draw_text(
+                hdc,
+                second,
+                sr(RECT {
+                    left: 58,
+                    top: 62 + date_block_offset,
+                    right: 372,
+                    bottom: 80 + date_block_offset,
+                }),
+                palette.muted,
+                fonts.small,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
+            );
         }
 
         draw_round_fill(
@@ -836,10 +923,6 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
         if !compact {
-            let today = app.today_main();
-            let today_is_active = app.year == today.year
-                && app.month == today.month
-                && app.selected_day == Some(today.day);
             if !today_is_active {
                 draw_round_fill(
                     hdc,
@@ -1053,11 +1136,14 @@ unsafe fn paint_calendar(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fo
         if app.settings.show_events {
             paint_events(hdc, app, palette, fonts);
         }
-        paint_footer(hdc, app, palette, fonts);
+        paint_footer(hdc, app, palette, fonts, ViewMode::Calendar);
     }
 }
 
 unsafe fn paint_day_tooltip(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts) {
+    if app.settings.compact_day {
+        return;
+    }
     let Some(cell) = app.hovered_cell else {
         return;
     };
@@ -1124,14 +1210,9 @@ unsafe fn update_day_hover(hwnd: HWND, x: i32, y: i32) {
         let mut app = state().lock().unwrap();
         let x = unscaled(x, app.scale());
         let y = unscaled(y, app.scale());
-        let next = if app.view == ViewMode::Calendar
-            && (GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
-            && (GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y)
+        let next = if let Some(cell) =
+            grid_cell_at_point(app.settings.compact_day, app.settings.calendar_rtl, x, y)
         {
-            let visual_column = (x - GRID_LEFT) / CELL_WIDTH;
-            let column = calendar_column(visual_column, app.settings.calendar_rtl);
-            let row = (y - GRID_TOP) / CELL_HEIGHT;
-            let cell = row * 7 + column;
             let (primary, _) = adjacent_date(app.settings.main_calendar, app.year, app.month, cell);
             let jalali = convert(primary, app.settings.main_calendar, CalendarKind::Jalali);
             if app
@@ -1155,6 +1236,16 @@ unsafe fn update_day_hover(hwnd: HWND, x: i32, y: i32) {
             InvalidateRect(hwnd, null(), 0);
         }
     }
+}
+
+fn grid_cell_at_point(compact: bool, rtl: bool, x: i32, y: i32) -> Option<i32> {
+    if compact
+        || !(GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
+        || !(GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y)
+    {
+        return None;
+    }
+    Some((y - GRID_TOP) / CELL_HEIGHT * 7 + calendar_column((x - GRID_LEFT) / CELL_WIDTH, rtl))
 }
 
 fn secondary_day_text(kind: CalendarKind, day: u32) -> String {
@@ -1323,10 +1414,10 @@ unsafe fn paint_events(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Font
     }
 }
 
-unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts) {
+unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts, view: ViewMode) {
     unsafe {
         let scale = app.scale();
-        let top = app.base_height() - BASE_FOOTER_HEIGHT;
+        let top = app.base_height_for(view) - BASE_FOOTER_HEIGHT;
         paint_update_banner(hdc, app, palette, fonts, top);
         draw_text(
             hdc,
@@ -1340,7 +1431,7 @@ unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Font
                 },
                 scale,
             ),
-            palette.accent,
+            palette.accent_label,
             fonts.tiny,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
@@ -1372,7 +1463,7 @@ unsafe fn paint_footer(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Font
                 },
                 scale,
             ),
-            palette.accent,
+            palette.accent_label,
             fonts.tiny,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
@@ -1443,572 +1534,6 @@ unsafe fn paint_update_banner(
     }
 }
 
-unsafe fn paint_settings(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts) {
-    unsafe {
-        let scale = app.scale();
-        let sr = |rect| scaled_rect(rect, scale);
-        draw_text(
-            hdc,
-            "تنظیمات",
-            sr(RECT {
-                left: 70,
-                top: 10,
-                right: 360,
-                bottom: 48,
-            }),
-            palette.accent,
-            fonts.title,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-        draw_round_fill(
-            hdc,
-            sr(RECT {
-                left: 370,
-                top: 12,
-                right: 416,
-                bottom: 46,
-            }),
-            palette.surface_alt,
-            scaled(11, scale),
-        );
-        draw_text(
-            hdc,
-            "›",
-            sr(RECT {
-                left: 370,
-                top: 8,
-                right: 416,
-                bottom: 46,
-            }),
-            palette.accent,
-            fonts.icon,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-        draw_text(
-            hdc,
-            "تقویم اصلی همیشه نمایش داده می‌شود؛ موارد زیر برای نمایش تقویم‌های جانبی هستند.",
-            sr(RECT {
-                left: 26,
-                top: 48,
-                right: 404,
-                bottom: 76,
-            }),
-            palette.muted,
-            fonts.tiny,
-            DT_RIGHT | DT_VCENTER | DT_WORDBREAK | DT_RTLREADING,
-        );
-
-        paint_value_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            78,
-            "پوسته",
-            app.settings.theme.title(),
-        );
-        paint_scale_row(hdc, app, palette, fonts, 122);
-        paint_value_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            166,
-            "تقویم اصلی",
-            app.settings.main_calendar.title(),
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            218,
-            "چیدمان تقویم از راست به چپ",
-            app.settings.calendar_rtl,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            262,
-            "نمایش تاریخ شمسی",
-            app.settings.show_jalali,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            306,
-            "نمایش تاریخ میلادی",
-            app.settings.show_gregorian,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            350,
-            "نمایش تاریخ قمری",
-            app.settings.show_hijri,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            394,
-            "نمایش عنوان تقویم‌های جانبی",
-            app.settings.show_subtitles,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            438,
-            "نمایش بخش مناسبت‌ها",
-            app.settings.show_events,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            482,
-            "نمایش تاریخ کامل در Tooltip",
-            app.settings.show_tray_date,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            526,
-            "بروزرسانی خودکار",
-            app.settings.auto_update,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            570,
-            "نمایش شماره روز روی آیکن Tray",
-            app.settings.tray_day_icon,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            614,
-            "نمایش شماره انگلیسی در System Tray",
-            app.settings.tray_english_digits,
-        );
-        paint_value_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            658,
-            "ظاهر شماره در System Tray",
-            app.settings.tray_icon_style.title(),
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            702,
-            "نمایش روزانه (بدون تقویم)",
-            app.settings.compact_day,
-        );
-        paint_toggle_row(
-            hdc,
-            app,
-            palette,
-            fonts,
-            746,
-            "اجرا همراه با ویندوز",
-            app.settings.autostart,
-        );
-
-        let installation = installation_state();
-        let installed = installation != InstallationState::NotInstalled;
-        let install_label = match installation {
-            InstallationState::NotInstalled => "نصب در Program Files",
-            InstallationState::InstalledCurrent => "نصب شده",
-            InstallationState::UpdateAvailable => "بروزرسانی نسخه نصب‌شده",
-            InstallationState::InstalledOtherUpToDate => "نسخه نصب‌شده بروز است",
-        };
-        let install_color = match installation {
-            InstallationState::NotInstalled | InstallationState::UpdateAvailable => palette.accent,
-            InstallationState::InstalledCurrent | InstallationState::InstalledOtherUpToDate => {
-                palette.surface_alt
-            }
-        };
-        let install_text_color = match installation {
-            InstallationState::NotInstalled | InstallationState::UpdateAvailable => {
-                palette.accent_text
-            }
-            InstallationState::InstalledCurrent | InstallationState::InstalledOtherUpToDate => {
-                palette.muted
-            }
-        };
-        draw_round_fill(
-            hdc,
-            sr(RECT {
-                left: 218,
-                top: 798,
-                right: 406,
-                bottom: 838,
-            }),
-            install_color,
-            scaled(12, scale),
-        );
-        draw_text(
-            hdc,
-            install_label,
-            sr(RECT {
-                left: 218,
-                top: 798,
-                right: 406,
-                bottom: 838,
-            }),
-            install_text_color,
-            fonts.small,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-        draw_round_fill(
-            hdc,
-            sr(RECT {
-                left: 24,
-                top: 798,
-                right: 212,
-                bottom: 838,
-            }),
-            if installed {
-                palette.holiday
-            } else {
-                palette.surface_alt
-            },
-            scaled(12, scale),
-        );
-        draw_text(
-            hdc,
-            "حذف برنامه",
-            sr(RECT {
-                left: 24,
-                top: 798,
-                right: 212,
-                bottom: 838,
-            }),
-            if installed {
-                palette.accent_text
-            } else {
-                palette.faint
-            },
-            fonts.small,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-        draw_round_fill(
-            hdc,
-            sr(RECT {
-                left: 24,
-                top: 845,
-                right: 406,
-                bottom: 887,
-            }),
-            palette.accent,
-            scaled(12, scale),
-        );
-        draw_text(
-            hdc,
-            "بازنشانی تنظیمات",
-            sr(RECT {
-                left: 24,
-                top: 845,
-                right: 406,
-                bottom: 887,
-            }),
-            palette.accent_text,
-            fonts.medium,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-        paint_footer(hdc, app, palette, fonts);
-    }
-}
-
-unsafe fn paint_value_row(
-    hdc: HDC,
-    app: &AppState,
-    palette: &Palette,
-    fonts: &Fonts,
-    top: i32,
-    label: &str,
-    value: &str,
-) {
-    unsafe {
-        let scale = app.scale();
-        draw_round_fill(
-            hdc,
-            scaled_rect(
-                RECT {
-                    left: 24,
-                    top,
-                    right: 406,
-                    bottom: top + 40,
-                },
-                scale,
-            ),
-            palette.surface_alt,
-            scaled(10, scale),
-        );
-        draw_text(
-            hdc,
-            label,
-            scaled_rect(
-                RECT {
-                    left: 170,
-                    top,
-                    right: 390,
-                    bottom: top + 40,
-                },
-                scale,
-            ),
-            palette.text,
-            fonts.regular,
-            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-        draw_round_fill(
-            hdc,
-            scaled_rect(
-                RECT {
-                    left: 34,
-                    top: top + 6,
-                    right: 148,
-                    bottom: top + 34,
-                },
-                scale,
-            ),
-            palette.calendar_panel,
-            scaled(11, scale),
-        );
-        draw_text(
-            hdc,
-            value,
-            scaled_rect(
-                RECT {
-                    left: 34,
-                    top: top + 6,
-                    right: 148,
-                    bottom: top + 34,
-                },
-                scale,
-            ),
-            palette.accent,
-            fonts.small,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-    }
-}
-
-unsafe fn paint_scale_row(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts, top: i32) {
-    unsafe {
-        let scale = app.scale();
-        draw_round_fill(
-            hdc,
-            scaled_rect(
-                RECT {
-                    left: 24,
-                    top,
-                    right: 406,
-                    bottom: top + 40,
-                },
-                scale,
-            ),
-            palette.surface_alt,
-            scaled(10, scale),
-        );
-        draw_text(
-            hdc,
-            "مقیاس رابط کاربری",
-            scaled_rect(
-                RECT {
-                    left: 170,
-                    top,
-                    right: 390,
-                    bottom: top + 40,
-                },
-                scale,
-            ),
-            palette.text,
-            fonts.regular,
-            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-        draw_round_fill(
-            hdc,
-            scaled_rect(
-                RECT {
-                    left: 30,
-                    top: top + 6,
-                    right: 62,
-                    bottom: top + 34,
-                },
-                scale,
-            ),
-            palette.calendar_panel,
-            scaled(9, scale),
-        );
-        draw_text(
-            hdc,
-            "−",
-            scaled_rect(
-                RECT {
-                    left: 30,
-                    top: top + 4,
-                    right: 62,
-                    bottom: top + 34,
-                },
-                scale,
-            ),
-            palette.accent,
-            fonts.icon,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-        draw_text(
-            hdc,
-            &format!("٪{}", persian_digits(app.settings.ui_scale)),
-            scaled_rect(
-                RECT {
-                    left: 64,
-                    top: top + 5,
-                    right: 116,
-                    bottom: top + 35,
-                },
-                scale,
-            ),
-            palette.text,
-            fonts.small,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-        draw_round_fill(
-            hdc,
-            scaled_rect(
-                RECT {
-                    left: 118,
-                    top: top + 6,
-                    right: 150,
-                    bottom: top + 34,
-                },
-                scale,
-            ),
-            palette.calendar_panel,
-            scaled(9, scale),
-        );
-        draw_text(
-            hdc,
-            "+",
-            scaled_rect(
-                RECT {
-                    left: 118,
-                    top: top + 5,
-                    right: 150,
-                    bottom: top + 34,
-                },
-                scale,
-            ),
-            palette.accent,
-            fonts.icon,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-    }
-}
-
-unsafe fn paint_toggle_row(
-    hdc: HDC,
-    app: &AppState,
-    palette: &Palette,
-    fonts: &Fonts,
-    top: i32,
-    label: &str,
-    enabled: bool,
-) {
-    unsafe {
-        let scale = app.scale();
-        draw_round_fill(
-            hdc,
-            scaled_rect(
-                RECT {
-                    left: 24,
-                    top,
-                    right: 406,
-                    bottom: top + 40,
-                },
-                scale,
-            ),
-            palette.surface_alt,
-            scaled(10, scale),
-        );
-        draw_text(
-            hdc,
-            label,
-            scaled_rect(
-                RECT {
-                    left: 102,
-                    top,
-                    right: 390,
-                    bottom: top + 40,
-                },
-                scale,
-            ),
-            palette.text,
-            fonts.regular,
-            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
-        );
-        let track = scaled_rect(
-            RECT {
-                left: 35,
-                top: top + 9,
-                right: 83,
-                bottom: top + 31,
-            },
-            scale,
-        );
-        draw_round_fill(
-            hdc,
-            track,
-            if enabled {
-                palette.accent
-            } else {
-                palette.faint
-            },
-            scaled(11, scale),
-        );
-        let knob_left = if enabled { 61 } else { 37 };
-        draw_round_fill(
-            hdc,
-            scaled_rect(
-                RECT {
-                    left: knob_left,
-                    top: top + 11,
-                    right: knob_left + 18,
-                    bottom: top + 29,
-                },
-                scale,
-            ),
-            if enabled {
-                palette.accent_text
-            } else {
-                palette.surface
-            },
-            scaled(9, scale),
-        );
-    }
-}
-
 fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
     let x = (lparam as u32 & 0xffff) as i16 as i32;
     let y = ((lparam as u32 >> 16) & 0xffff) as i16 as i32;
@@ -2016,17 +1541,12 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
 }
 
 unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
+    let mut open_settings = false;
     let mut show_about_dialog = false;
     let mut open_website_link = false;
     let mut open_github_link = false;
-    let mut refresh_tooltip = false;
-    let mut refresh_tray_visual = false;
-    let mut enable_auto_update = false;
-    let mut install_requested = false;
-    let mut uninstall_requested = false;
     let mut start_update = false;
     let mut update_release_url = None;
-    let mut resize = false;
     {
         let mut app = state().lock().unwrap();
         let x = unscaled(x, app.scale());
@@ -2048,217 +1568,102 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
                 _ => {}
             }
         } else {
-            match app.view {
-                ViewMode::Calendar => {
-                    if y >= 8 && y <= 48 && x <= 75 {
-                        if app.settings.compact_day {
-                            move_calendar_day(&mut app, -1);
-                        } else {
-                            let kind = app.settings.main_calendar;
-                            let (mut year, mut month) = (app.year, app.month);
-                            add_month(
-                                kind,
-                                &mut year,
-                                &mut month,
-                                if app.settings.calendar_rtl { 1 } else { -1 },
-                            );
-                            app.year = year;
-                            app.month = month;
-                            app.selected_day = None;
-                            app.event_scroll = 0;
-                        }
-                    } else if y >= 8 && y <= 48 && x >= 355 {
-                        if app.settings.compact_day {
-                            move_calendar_day(&mut app, 1);
-                        } else {
-                            let kind = app.settings.main_calendar;
-                            let (mut year, mut month) = (app.year, app.month);
-                            add_month(
-                                kind,
-                                &mut year,
-                                &mut month,
-                                if app.settings.calendar_rtl { -1 } else { 1 },
-                            );
-                            app.year = year;
-                            app.month = month;
-                            app.selected_day = None;
-                            app.event_scroll = 0;
-                        }
-                    } else if (54..=94).contains(&y) && x <= 62 {
-                        show_about_dialog = true;
-                    } else if (54..=94).contains(&y) && x >= 368 {
-                        app.view = ViewMode::Settings;
-                        resize = true;
-                    } else if !app.settings.compact_day
-                        && (78..=113).contains(&y)
-                        && (160..=270).contains(&x)
-                    {
-                        let today = app.today_main();
-                        let today_is_active = app.year == today.year
-                            && app.month == today.month
-                            && app.selected_day == Some(today.day);
-                        if !today_is_active {
-                            app.year = today.year;
-                            app.month = today.month;
-                            app.selected_day = Some(today.day);
-                            app.event_scroll = 0;
-                        }
-                    } else if !app.settings.compact_day
-                        && (GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y)
-                        && (GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
-                    {
-                        let visual_column = (x - GRID_LEFT) / CELL_WIDTH;
-                        let column = calendar_column(visual_column, app.settings.calendar_rtl);
-                        let row = (y - GRID_TOP) / CELL_HEIGHT;
-                        let cell = row * 7 + column;
-                        let (clicked, in_current) =
-                            adjacent_date(app.settings.main_calendar, app.year, app.month, cell);
-                        if !in_current {
-                            app.year = clicked.year;
-                            app.month = clicked.month;
-                        }
-                        app.selected_day = if in_current && app.selected_day == Some(clicked.day) {
-                            None
-                        } else {
-                            Some(clicked.day)
-                        };
-                        app.event_scroll = 0;
-                    } else if app.settings.show_events
-                        && (16..=36).contains(&x)
-                        && (events_top(&app) + 36..=events_top(&app) + BASE_EVENTS_HEIGHT - 8)
-                            .contains(&y)
-                    {
-                        let count = event_items_for_view(&app).len();
-                        let max_scroll = count.saturating_sub(3);
-                        if max_scroll > 0 {
-                            let event_top = events_top(&app);
-                            let track_top = event_top + 40;
-                            let track_bottom = event_top + BASE_EVENTS_HEIGHT - 18;
-                            let relative = (y - track_top).clamp(0, track_bottom - track_top);
-                            app.event_scroll = (relative as usize * max_scroll
-                                / (track_bottom - track_top) as usize)
-                                .min(max_scroll);
-                        }
-                    }
+            if y >= 8 && y <= 48 && x <= 75 {
+                if app.settings.compact_day {
+                    move_calendar_day(&mut app, -1);
+                } else {
+                    let kind = app.settings.main_calendar;
+                    let (mut year, mut month) = (app.year, app.month);
+                    add_month(
+                        kind,
+                        &mut year,
+                        &mut month,
+                        if app.settings.calendar_rtl { 1 } else { -1 },
+                    );
+                    app.year = year;
+                    app.month = month;
+                    app.selected_day = None;
+                    app.event_scroll = 0;
                 }
-                ViewMode::Settings => {
-                    if y <= 54 && x >= 350 {
-                        app.view = ViewMode::Calendar;
-                        resize = true;
-                    } else if (76..=120).contains(&y) {
-                        app.settings.theme = app.settings.theme.toggle();
-                        app.settings.save();
-                    } else if (120..=164).contains(&y) {
-                        if x <= 68 {
-                            app.settings.smaller();
-                        } else if (112..=160).contains(&x) {
-                            app.settings.larger();
-                        }
-                        app.settings.save();
-                        resize = true;
-                    } else if (164..=210).contains(&y) {
-                        let next = app.settings.main_calendar.next();
-                        app.set_main_calendar(next);
-                        app.settings.save();
-                    } else if (216..=258).contains(&y) {
-                        app.settings.calendar_rtl = !app.settings.calendar_rtl;
-                        app.settings.save();
-                    } else if (260..=302).contains(&y) {
-                        app.settings.show_jalali = !app.settings.show_jalali;
-                        app.settings.save();
-                    } else if (304..=346).contains(&y) {
-                        app.settings.show_gregorian = !app.settings.show_gregorian;
-                        app.settings.save();
-                    } else if (348..=390).contains(&y) {
-                        app.settings.show_hijri = !app.settings.show_hijri;
-                        app.settings.save();
-                    } else if (392..=434).contains(&y) {
-                        app.settings.show_subtitles = !app.settings.show_subtitles;
-                        app.settings.save();
-                    } else if (436..=478).contains(&y) {
-                        app.settings.show_events = !app.settings.show_events;
-                        app.settings.save();
-                        resize = true;
-                    } else if (480..=522).contains(&y) {
-                        app.settings.show_tray_date = !app.settings.show_tray_date;
-                        app.settings.save();
-                        refresh_tooltip = true;
-                    } else if (524..=568).contains(&y) {
-                        app.settings.auto_update = !app.settings.auto_update;
-                        enable_auto_update = app.settings.auto_update;
-                        app.settings.save();
-                        resize = true;
-                    } else if (569..=612).contains(&y) {
-                        app.settings.tray_day_icon = !app.settings.tray_day_icon;
-                        app.settings.save();
-                        refresh_tray_visual = true;
-                    } else if (613..=656).contains(&y) {
-                        app.settings.tray_english_digits = !app.settings.tray_english_digits;
-                        app.settings.save();
-                        refresh_tray_visual = true;
-                    } else if (657..=700).contains(&y) {
-                        app.settings.tray_icon_style = app.settings.tray_icon_style.next();
-                        app.settings.save();
-                        refresh_tray_visual = true;
-                    } else if (701..=744).contains(&y) {
-                        app.settings.compact_day = !app.settings.compact_day;
-                        if app.settings.compact_day && app.selected_day.is_none() {
-                            let today = app.today_main();
-                            app.selected_day =
-                                Some(if app.year == today.year && app.month == today.month {
-                                    today.day
-                                } else {
-                                    1
-                                });
-                        }
-                        app.event_scroll = 0;
-                        app.settings.save();
-                        resize = true;
-                    } else if (745..=792).contains(&y) {
-                        let next = !app.settings.autostart;
-                        if set_autostart(next) {
-                            app.settings.autostart = next;
-                            app.settings.save();
-                        }
-                    } else if (794..=842).contains(&y) {
-                        if x >= 215 {
-                            if matches!(
-                                installation_state(),
-                                InstallationState::NotInstalled
-                                    | InstallationState::UpdateAvailable
-                            ) {
-                                install_requested = true;
-                            }
-                        } else {
-                            uninstall_requested = true;
-                        }
-                    } else if (843..=898).contains(&y) {
-                        let default_settings = Settings::default();
-                        let next_main = default_settings.main_calendar;
-                        if next_main != app.settings.main_calendar {
-                            app.set_main_calendar(next_main);
-                        }
-                        if app.settings.autostart && !default_settings.autostart {
-                            let _ = set_autostart(false);
-                        }
-                        app.settings = default_settings;
-                        app.settings.save();
-                        resize = true;
-                        refresh_tooltip = true;
-                        refresh_tray_visual = true;
-                        enable_auto_update = app.settings.auto_update;
-                    }
+            } else if y >= 8 && y <= 48 && x >= 355 {
+                if app.settings.compact_day {
+                    move_calendar_day(&mut app, 1);
+                } else {
+                    let kind = app.settings.main_calendar;
+                    let (mut year, mut month) = (app.year, app.month);
+                    add_month(
+                        kind,
+                        &mut year,
+                        &mut month,
+                        if app.settings.calendar_rtl { -1 } else { 1 },
+                    );
+                    app.year = year;
+                    app.month = month;
+                    app.selected_day = None;
+                    app.event_scroll = 0;
+                }
+            } else if (54..=94).contains(&y) && x <= 62 {
+                show_about_dialog = true;
+            } else if (54..=94).contains(&y) && x >= 368 {
+                open_settings = true;
+            } else if !app.settings.compact_day
+                && (78..=113).contains(&y)
+                && (160..=270).contains(&x)
+            {
+                let today = app.today_main();
+                let today_is_active = app.year == today.year
+                    && app.month == today.month
+                    && app.selected_day == Some(today.day);
+                if !today_is_active {
+                    app.year = today.year;
+                    app.month = today.month;
+                    app.selected_day = Some(today.day);
+                    app.event_scroll = 0;
+                }
+            } else if !app.settings.compact_day
+                && (GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y)
+                && (GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
+            {
+                let visual_column = (x - GRID_LEFT) / CELL_WIDTH;
+                let column = calendar_column(visual_column, app.settings.calendar_rtl);
+                let row = (y - GRID_TOP) / CELL_HEIGHT;
+                let cell = row * 7 + column;
+                let (clicked, in_current) =
+                    adjacent_date(app.settings.main_calendar, app.year, app.month, cell);
+                if !in_current {
+                    app.year = clicked.year;
+                    app.month = clicked.month;
+                }
+                app.selected_day = if in_current && app.selected_day == Some(clicked.day) {
+                    None
+                } else {
+                    Some(clicked.day)
+                };
+                app.event_scroll = 0;
+            } else if app.settings.show_events
+                && (16..=36).contains(&x)
+                && (events_top(&app) + 36..=events_top(&app) + BASE_EVENTS_HEIGHT - 8).contains(&y)
+            {
+                let count = event_items_for_view(&app).len();
+                let max_scroll = count.saturating_sub(3);
+                if max_scroll > 0 {
+                    let event_top = events_top(&app);
+                    let track_top = event_top + 40;
+                    let track_bottom = event_top + BASE_EVENTS_HEIGHT - 18;
+                    let relative = (y - track_top).clamp(0, track_bottom - track_top);
+                    app.event_scroll = (relative as usize * max_scroll
+                        / (track_bottom - track_top) as usize)
+                        .min(max_scroll);
                 }
             }
         }
     }
-    if resize {
-        unsafe {
-            resize_main_window(hwnd, true);
-        }
-    }
     unsafe {
         InvalidateRect(hwnd, null(), 0);
+    }
+    settings_window::repaint_all();
+    if open_settings {
+        settings_window::show(hwnd);
     }
     if show_about_dialog {
         unsafe {
@@ -2274,33 +1679,6 @@ unsafe fn handle_main_click(hwnd: HWND, x: i32, y: i32) {
         unsafe {
             open_github(hwnd);
         }
-    }
-    if refresh_tooltip {
-        unsafe {
-            refresh_tray_tooltip(hwnd);
-        }
-    }
-    if refresh_tray_visual {
-        unsafe {
-            refresh_tray_icon(hwnd);
-        }
-    }
-    if install_requested && unsafe { request_install(hwnd) } {
-        EXITING.store(true, Ordering::SeqCst);
-        unsafe {
-            DestroyWindow(hwnd);
-        }
-        return;
-    }
-    if uninstall_requested && unsafe { request_uninstall(hwnd) } {
-        EXITING.store(true, Ordering::SeqCst);
-        unsafe {
-            DestroyWindow(hwnd);
-        }
-        return;
-    }
-    if enable_auto_update && matches!(update::status(), update::UpdateStatus::Available(_)) {
-        update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE);
     }
     if start_update {
         update::start_download(hwnd, WM_UPDATE_STATUS, WM_APPLY_UPDATE);
@@ -2393,25 +1771,14 @@ unsafe fn copy_text_to_clipboard(hwnd: HWND, text: &str) -> bool {
 unsafe fn copy_date_at_point(hwnd: HWND, x: i32, y: i32) {
     let text = {
         let app = state().lock().unwrap();
-        if app.view != ViewMode::Calendar {
-            return;
-        }
         let x = unscaled(x, app.scale());
         let y = unscaled(y, app.scale());
-        if !(GRID_LEFT..GRID_LEFT + GRID_WIDTH).contains(&x)
-            || !(GRID_TOP..GRID_TOP + CELL_HEIGHT * 6).contains(&y)
-        {
+        let Some(cell) =
+            grid_cell_at_point(app.settings.compact_day, app.settings.calendar_rtl, x, y)
+        else {
             return;
-        }
-        let visual_column = (x - GRID_LEFT) / CELL_WIDTH;
-        let column = calendar_column(visual_column, app.settings.calendar_rtl);
-        let row = (y - GRID_TOP) / CELL_HEIGHT;
-        let (date, _) = adjacent_date(
-            app.settings.main_calendar,
-            app.year,
-            app.month,
-            row * 7 + column,
-        );
+        };
+        let (date, _) = adjacent_date(app.settings.main_calendar, app.year, app.month, cell);
         clipboard_date(app.settings.main_calendar, date)
     };
     unsafe {
@@ -2426,7 +1793,9 @@ unsafe fn load_app_icon(instance: HINSTANCE) -> HICON {
 unsafe fn create_tray_day_icon(
     day: u32,
     english_digits: bool,
-    style: TrayIconStyle,
+    white_text: bool,
+    accent_background: bool,
+    accent: [u8; 3],
 ) -> HICON {
     unsafe {
         let screen = GetDC(null_mut());
@@ -2463,8 +1832,8 @@ unsafe fn create_tray_day_icon(
                 right: 32,
                 bottom: 32,
             },
-            if style == TrayIconStyle::YellowBlack {
-                rgb(248, 211, 88)
+            if accent_background {
+                rgb(accent[0], accent[1], accent[2])
             } else {
                 rgb(0, 0, 0)
             },
@@ -2474,7 +1843,7 @@ unsafe fn create_tray_day_icon(
         // The yellow mode keeps the rounded tile. Transparent modes only mark glyphs opaque.
         let old_mask_bitmap = SelectObject(mask_dc, mask as HGDIOBJ);
         PatBlt(mask_dc, 0, 0, 32, 32, WHITENESS);
-        if style == TrayIconStyle::YellowBlack {
+        if accent_background {
             let old_mask_brush = SelectObject(mask_dc, GetStockObject(BLACK_BRUSH) as HGDIOBJ);
             let old_mask_pen = SelectObject(mask_dc, GetStockObject(BLACK_PEN) as HGDIOBJ);
             RoundRect(mask_dc, 1, 1, 31, 31, 5, 5);
@@ -2507,7 +1876,7 @@ unsafe fn create_tray_day_icon(
                 bottom: 33,
             }
         };
-        let transparent_style = style != TrayIconStyle::YellowBlack;
+        let transparent_style = !accent_background;
         let font = if english_digits {
             // English digits use a bold weight. Transparent modes get a larger glyph.
             create_font(
@@ -2528,9 +1897,10 @@ unsafe fn create_tray_day_icon(
             SetTextCharacterExtra(color_dc, -2);
             SetTextCharacterExtra(mask_dc, -2);
         }
-        let text_color = match style {
-            TrayIconStyle::TransparentWhite => rgb(255, 255, 255),
-            TrayIconStyle::TransparentBlack | TrayIconStyle::YellowBlack => rgb(18, 18, 18),
+        let text_color = if white_text {
+            rgb(255, 255, 255)
+        } else {
+            rgb(0, 0, 0)
         };
         draw_text(
             color_dc,
@@ -2540,7 +1910,7 @@ unsafe fn create_tray_day_icon(
             font,
             text_format,
         );
-        if style != TrayIconStyle::YellowBlack {
+        if !accent_background {
             draw_text(
                 mask_dc,
                 &day_text,
@@ -2577,7 +1947,9 @@ unsafe fn selected_tray_icon(app: &AppState) -> (HICON, bool) {
             let icon = create_tray_day_icon(
                 today.day,
                 app.settings.tray_english_digits,
-                app.settings.tray_icon_style,
+                app.settings.tray_text_white,
+                app.settings.tray_accent_background,
+                theme::ThemeColors::from_settings(&app.settings).accent,
             );
             if !icon.is_null() {
                 return (icon, true);
@@ -2738,7 +2110,7 @@ unsafe fn paint_confirm(hwnd: HWND) {
 
         let app = state().lock().unwrap();
         let scale = app.scale();
-        let palette = Palette::from_theme(app.settings.theme);
+        let palette = Palette::from_colors(theme::ThemeColors::from_settings(&app.settings));
         let fonts = Fonts::create(scale);
         let width = scaled(BASE_CONFIRM_WIDTH, scale);
         let height = scaled(BASE_CONFIRM_HEIGHT, scale);
@@ -2791,7 +2163,7 @@ unsafe fn paint_confirm(hwnd: HWND) {
                 },
                 scale,
             ),
-            palette.accent,
+            palette.accent_label,
             fonts.title,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
@@ -3446,6 +2818,7 @@ unsafe fn resize_main_window(hwnd: HWND, preserve_bottom: bool) {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
         let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
         SetWindowRgn(hwnd, region, 1);
+        settings_window::reposition();
     }
 }
 
@@ -3473,12 +2846,14 @@ unsafe fn show_popup(hwnd: HWND) {
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
         InvalidateRect(hwnd, null(), 0);
+        settings_window::reposition();
     }
 }
 
 unsafe fn toggle_popup(hwnd: HWND) {
     unsafe {
         if IsWindowVisible(hwnd) != 0 {
+            settings_window::close();
             ShowWindow(hwnd, SW_HIDE);
         } else {
             show_popup(hwnd);
@@ -3534,9 +2909,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         match command as usize {
             CMD_OPEN => show_popup(hwnd),
             CMD_SETTINGS => {
-                state().lock().unwrap().view = ViewMode::Settings;
-                resize_main_window(hwnd, true);
                 show_popup(hwnd);
+                settings_window::show(hwnd);
             }
             CMD_ABOUT => show_about(hwnd),
             CMD_UPDATE => request_manual_update(hwnd),
@@ -3568,7 +2942,7 @@ unsafe extern "system" fn main_window_proc(
         }
         WM_PAINT => {
             unsafe {
-                paint_main(hwnd);
+                paint_main(hwnd, ViewMode::Calendar, 0);
             }
             0
         }
@@ -3665,7 +3039,7 @@ unsafe extern "system" fn main_window_proc(
         WM_MOUSEWHEEL => {
             let delta = ((wparam >> 16) & 0xffff) as i16 as i32;
             let mut app = state().lock().unwrap();
-            if app.view == ViewMode::Calendar && app.settings.show_events {
+            if app.settings.show_events {
                 let count = event_items_for_view(&app).len();
                 let max_scroll = count.saturating_sub(3);
                 if delta < 0 {
@@ -3683,19 +3057,9 @@ unsafe extern "system" fn main_window_proc(
         WM_KEYDOWN => {
             match wparam as u32 {
                 0x1B => {
-                    let mut app = state().lock().unwrap();
-                    if app.view == ViewMode::Settings {
-                        app.view = ViewMode::Calendar;
-                        drop(app);
-                        unsafe {
-                            resize_main_window(hwnd, true);
-                            InvalidateRect(hwnd, null(), 0);
-                        }
-                    } else {
-                        drop(app);
-                        unsafe {
-                            ShowWindow(hwnd, SW_HIDE);
-                        }
+                    settings_window::close();
+                    unsafe {
+                        ShowWindow(hwnd, SW_HIDE);
                     }
                 }
                 0x74 => {
@@ -3707,7 +3071,7 @@ unsafe extern "system" fn main_window_proc(
                 0x25 | 0x27 => {
                     let left = wparam as u32 == 0x25;
                     let mut app = state().lock().unwrap();
-                    if app.view == ViewMode::Calendar {
+                    {
                         if app.settings.compact_day {
                             move_calendar_day(&mut app, if left { -1 } else { 1 });
                         } else {
@@ -3734,31 +3098,32 @@ unsafe extern "system" fn main_window_proc(
             0
         }
         WM_ACTIVATE => {
-            if (wparam as u32 & 0xffff) == WA_INACTIVE
-                && !EXITING.load(Ordering::SeqCst)
-                && ABOUT_HWND.load(Ordering::SeqCst) == 0
-                && CONFIRM_HWND.load(Ordering::SeqCst) == 0
-            {
+            if (wparam as u32 & 0xffff) == WA_INACTIVE {
                 unsafe {
-                    ShowWindow(hwnd, SW_HIDE);
+                    PostMessageW(hwnd, WM_DISMISS_POPUPS, 0, 0);
                 }
             }
             0
         }
+        WM_DISMISS_POPUPS => {
+            settings_window::dismiss_if_outside(hwnd);
+            0
+        }
         WM_CLOSE => {
+            settings_window::close();
             unsafe {
                 ShowWindow(hwnd, SW_HIDE);
             }
             0
         }
         WM_SHOW_EXISTING => {
-            state().lock().unwrap().view = ViewMode::Calendar;
             unsafe {
                 resize_main_window(hwnd, true);
                 show_popup(hwnd);
             }
             0
         }
+        WM_TRAY if color_picker::is_open() => 0,
         WM_TRAY => {
             match lparam as u32 {
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK => unsafe {
@@ -3848,7 +3213,7 @@ unsafe fn paint_about(hwnd: HWND) {
         }
         let app = state().lock().unwrap();
         let scale = app.scale();
-        let palette = Palette::from_theme(app.settings.theme);
+        let palette = Palette::from_colors(theme::ThemeColors::from_settings(&app.settings));
         let fonts = Fonts::create(scale);
         let width = scaled(BASE_ABOUT_WIDTH, scale);
         let height = scaled(BASE_ABOUT_HEIGHT, scale);
@@ -3885,7 +3250,7 @@ unsafe fn paint_about(hwnd: HWND) {
                 },
                 scale,
             ),
-            palette.accent,
+            palette.accent_label,
             fonts.title,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
@@ -3901,7 +3266,7 @@ unsafe fn paint_about(hwnd: HWND) {
                 },
                 scale,
             ),
-            palette.accent,
+            palette.accent_label,
             fonts.regular,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
@@ -3971,7 +3336,7 @@ unsafe fn paint_about(hwnd: HWND) {
                 },
                 scale,
             ),
-            palette.accent,
+            palette.accent_label,
             fonts.small,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_RTLREADING,
         );
@@ -4201,6 +3566,27 @@ fn main() {
 
 #[cfg(test)]
 mod layout_tests {
+    #[test]
+    fn compact_view_has_no_calendar_grid_hit_targets() {
+        use super::*;
+        for rtl in [false, true] {
+            for row in 0..6 {
+                for column in 0..7 {
+                    let x = GRID_LEFT + column * CELL_WIDTH + 10;
+                    let y = GRID_TOP + row * CELL_HEIGHT + 10;
+                    assert_eq!(grid_cell_at_point(true, rtl, x, y), None);
+                    assert_eq!(
+                        grid_cell_at_point(false, rtl, x, y),
+                        Some(row * 7 + calendar_column(column, rtl))
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            grid_cell_at_point(false, true, GRID_LEFT, GRID_TOP - 1),
+            None
+        );
+    }
     use super::{calendar_column, executable_version};
 
     #[test]
