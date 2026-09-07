@@ -1,6 +1,8 @@
-//! Inline Win32 settings controls using rust-colorpicker's native dialog.
+//! Inline Win32 settings controls using rust-colorpicker's configurable native picker.
 use crate::{AppState, Fonts, Palette, Settings, theme::ThemeColors};
-use rust_colorpicker::{Color, ColorPicker};
+use rust_colorpicker::{
+    Color, ColorPicker, PickerChrome, PickerEvent, PickerFont, PickerLabels, PickerTheme,
+};
 use std::ptr::null;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::*;
@@ -8,6 +10,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 static OPEN: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Accent,
@@ -34,13 +37,50 @@ pub fn hit_test(x: i32, y: i32) -> Option<Target> {
 }
 
 fn unpack(color: COLORREF) -> [u8; 3] {
-    {
-        let color = Color::from_colorref(color);
-        [color.r, color.g, color.b]
-    }
+    let color = Color::from_colorref(color);
+    [color.r, color.g, color.b]
 }
+
 fn packed(color: [u8; 3]) -> COLORREF {
     Color::rgb(color[0], color[1], color[2]).to_colorref()
+}
+
+fn picker_theme(palette: &Palette) -> PickerTheme {
+    let color = Color::from_colorref;
+    PickerTheme {
+        background: color(palette.background),
+        surface: color(palette.surface),
+        surface_alt: color(palette.surface_alt),
+        text: color(palette.text),
+        muted: color(palette.muted),
+        border: color(palette.border),
+        accent: color(palette.accent),
+        accent_text: color(palette.accent_text),
+        checker_light: color(palette.surface_alt),
+        checker_dark: color(palette.calendar_panel),
+    }
+}
+
+fn set_target_color(settings: &mut Settings, target: Target, color: [u8; 3]) {
+    let mut colors = ThemeColors::from_settings(settings);
+    match target {
+        Target::Primary => colors.primary = color,
+        Target::Accent => colors.accent = color,
+    }
+    colors.apply(settings);
+}
+
+fn repaint_host(hwnd: HWND) {
+    unsafe {
+        crate::settings_window::repaint_all();
+        let main = crate::settings_window::owner();
+        if !main.is_null() && IsWindow(main) != 0 {
+            crate::refresh_tray_icon(main);
+        }
+        if !hwnd.is_null() && IsWindow(hwnd) != 0 {
+            InvalidateRect(hwnd, null(), 0);
+        }
+    }
 }
 
 pub unsafe fn paint_row(hdc: HDC, app: &AppState, palette: &Palette, fonts: &Fonts) {
@@ -119,54 +159,85 @@ pub fn open(hwnd: HWND, target: Target) {
     if OPEN.swap(true, Ordering::SeqCst) {
         return;
     }
-    let colors = ThemeColors::from_settings(&crate::state().lock().unwrap().settings);
-    let initial = match target {
-        Target::Primary => colors.primary,
-        Target::Accent => colors.accent,
+
+    let (initial, palette) = {
+        let app = crate::state().lock().unwrap();
+        let colors = ThemeColors::from_settings(&app.settings);
+        let initial = match target {
+            Target::Primary => colors.primary,
+            Target::Accent => colors.accent,
+        };
+        (initial, Palette::from_colors(colors))
     };
-    // Settings store RGB, so keep the package's optional alpha control hidden.
+
+    let initial_color = Color::rgb(initial[0], initial[1], initial[2]);
     let mut picker = ColorPicker::new();
     picker.set_show_alpha(false);
-    let result = picker.pick_with_owner(hwnd, Color::rgb(initial[0], initial[1], initial[2]));
+    picker.set_scale_percent(crate::settings_window::display_scale());
+    picker.set_theme(picker_theme(&palette));
+    picker.set_chrome(PickerChrome::Borderless);
+    picker.set_labels(PickerLabels::persian());
+    picker.set_font(PickerFont::new("Vazirmatn", 15, 16));
+    picker.set_rtl(true);
+    picker.set_corner_radius(12);
+
+    let result = picker.pick_with_owner_live(hwnd, initial_color, |event| {
+        let selected = match event {
+            PickerEvent::Preview(color)
+            | PickerEvent::Accepted(color)
+            | PickerEvent::Cancelled(color) => unpack(color.to_colorref()),
+        };
+        {
+            let mut app = crate::state().lock().unwrap();
+            set_target_color(&mut app.settings, target, selected);
+        }
+        repaint_host(hwnd);
+    });
+
     OPEN.store(false, Ordering::SeqCst);
     if unsafe { IsWindow(hwnd) } == 0 {
         return;
     }
-    if let Ok(Some(selected)) = result {
-        let saved = {
-            let mut app = crate::state().lock().unwrap();
-            // Preserve any other settings changed while the dialog was open.
-            let mut colors = ThemeColors::from_settings(&app.settings);
-            match target {
-                Target::Primary => colors.primary = unpack(selected.to_colorref()),
-                Target::Accent => colors.accent = unpack(selected.to_colorref()),
+
+    match result {
+        Ok(Some(selected)) => {
+            let selected = unpack(selected.to_colorref());
+            let saved = {
+                let mut app = crate::state().lock().unwrap();
+                let mut colors = ThemeColors::from_settings(&app.settings);
+                match target {
+                    Target::Primary => colors.primary = selected,
+                    Target::Accent => colors.accent = selected,
+                }
+                // Re-establish the pre-dialog value as the rollback point before
+                // persisting the accepted preview.
+                set_target_color(&mut app.settings, target, initial);
+                save_colors(&mut app.settings, colors)
+            };
+            if let Err(error) = saved {
+                report_error(hwnd, &format!("ذخیرهٔ رنگ ممکن نشد.\n{error}"));
             }
-            save_colors(&mut app.settings, colors)
-        };
-        if let Err(error) = saved {
-            report_error(hwnd, &format!("ذخیرهٔ رنگ ممکن نشد.\n{error}"));
         }
-    } else if let Err(error) = result {
-        report_error(
-            hwnd,
-            &format!("باز کردن کالرپیکر ممکن نشد.\nWindows error: {error}"),
-        );
+        Ok(None) => {
+            let mut app = crate::state().lock().unwrap();
+            set_target_color(&mut app.settings, target, initial);
+        }
+        Err(error) => {
+            {
+                let mut app = crate::state().lock().unwrap();
+                set_target_color(&mut app.settings, target, initial);
+            }
+            report_error(
+                hwnd,
+                &format!("باز کردن کالرپیکر ممکن نشد.\nWindows error: {error}"),
+            );
+        }
     }
+
     unsafe {
         SetForegroundWindow(hwnd);
-        crate::settings_window::repaint_all();
-        let main = crate::settings_window::owner();
-        if !main.is_null() && IsWindow(main) != 0 {
-            crate::refresh_tray_icon(main);
-        }
-        InvalidateRect(hwnd, null(), 0);
-        for handle in [&crate::ABOUT_HWND, &crate::CONFIRM_HWND] {
-            let window = handle.load(Ordering::SeqCst) as HWND;
-            if !window.is_null() && IsWindow(window) != 0 {
-                InvalidateRect(window, null(), 0);
-            }
-        }
     }
+    repaint_host(hwnd);
 }
 
 #[cfg(test)]
@@ -232,6 +303,11 @@ mod tests {
             assert_ne!(SetTimer(owner, 1, 100, Some(finish)), 0);
             let mut picker = ColorPicker::new();
             picker.set_show_alpha(false);
+            picker.set_scale_percent(100);
+            picker.set_chrome(PickerChrome::Borderless);
+            picker.set_labels(PickerLabels::persian());
+            picker.set_font(PickerFont::new("Vazirmatn", 15, 16));
+            picker.set_rtl(true);
             let initial = Color::rgba(18, 52, 86, 123);
             let accepted = picker.pick_with_owner(owner, initial);
             ACTION.store(0x1B, Ordering::SeqCst);

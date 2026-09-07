@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "gahyar"
-version = "2.9.1"
+version = "2.9.2"
 dependencies = [
  "rust-colorpicker",
  "serde",
@@ -44,8 +44,8 @@ dependencies = [
 
 [[package]]
 name = "rust-colorpicker"
-version = "0.2.0"
-source = "git+https://github.com/emadgh/rust-colorpicker?rev=27353da14f095f77bb845684ea6b2bbb0481c10f#27353da14f095f77bb845684ea6b2bbb0481c10f"
+version = "0.3.0"
+source = "git+https://github.com/emadgh/rust-colorpicker?rev=038fa545b4f749539682b97422442f9607f3eb2e#038fa545b4f749539682b97422442f9607f3eb2e"
 dependencies = [
  "windows-sys",
 ]
